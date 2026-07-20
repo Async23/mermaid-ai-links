@@ -1,0 +1,482 @@
+from __future__ import annotations
+
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+from mermaid_ai_links import links
+
+
+def free_port() -> int:
+    with socket.socket() as candidate:
+        candidate.bind(("127.0.0.1", 0))
+        return candidate.getsockname()[1]
+
+
+def first_app_link(markdown: str) -> links.ParsedLink:
+    parsed = next(
+        (links.parse_app_link_line(line) for line in markdown.splitlines() if links.parse_app_link_line(line)),
+        None,
+    )
+    assert parsed is not None
+    return parsed
+
+
+class LinkSyncTests(unittest.TestCase):
+    def test_replaces_live_links_and_generates_exactly_one_app_link_per_block(self) -> None:
+        markdown = """before
+[↗ 在 Mermaid Live 打开编辑](https://mermaid.live/edit#pako:abc)
+```mermaid
+flowchart TB
+    first[\"第一张\"] --> done[\"完成\"]
+```
+
+````python
+```mermaid
+fake --> nested
+```
+````
+
+~~~mermaid extra
+sequenceDiagram
+    Alice->>Bob: 你好
+~~~
+"""
+        path = Path("/tmp/笔记.md")
+        updated, result = links.sync_text(markdown, path, links.DEFAULT_ORIGIN, b"s" * 32)
+
+        self.assertEqual(2, result.blocks_found)
+        self.assertEqual(2, result.blocks_changed)
+        self.assertNotIn("mermaid.live", updated)
+        self.assertEqual(2, updated.count(f"[{links.LINK_LABEL}]"))
+        self.assertRegex(updated, rf"\]\(http://127\.0\.0\.1:{links.DEFAULT_PORT}/v1/open/")
+        self.assertIn("````python\n```mermaid\nfake --> nested", updated)
+
+        second, second_result = links.sync_text(updated, path, links.DEFAULT_ORIGIN, b"s" * 32)
+        self.assertEqual(updated, second)
+        self.assertEqual(0, second_result.blocks_changed)
+        self.assertEqual(result.block_ids, second_result.block_ids)
+
+    def test_click_reads_edited_source_without_regenerating_link(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "note.md"
+            secret_path = Path(directory) / "secret"
+            path.write_text("```mermaid\nflowchart TB\n  old --> value\n```\n", encoding="utf-8")
+            links.sync_file(path, secret_path=secret_path)
+            generated = path.read_text(encoding="utf-8")
+            parsed = first_app_link(generated)
+
+            edited = generated.replace("old --> value", "latest --> current")
+            path.write_text(edited, encoding="utf-8")
+            self.assertEqual(parsed.url, first_app_link(edited).url)
+
+            secret = links.load_or_create_secret(secret_path, create=False)
+            resolved = links.resolve_linked_diagram(parsed.token, parsed.signature, secret)
+            self.assertEqual("flowchart TB\n  latest --> current\n", resolved.code)
+            self.assertEqual(1, resolved.block_index)
+
+    def test_preserves_block_ids_when_new_block_is_inserted(self) -> None:
+        path = Path("/tmp/note.md")
+        secret = b"k" * 32
+        original, first = links.sync_text(
+            "```mermaid\nA-->B\n```\n\n```mermaid\nC-->D\n```\n",
+            path,
+            links.DEFAULT_ORIGIN,
+            secret,
+        )
+        inserted = "```mermaid\nNEW-->BLOCK\n```\n\n" + original
+        updated, second = links.sync_text(inserted, path, links.DEFAULT_ORIGIN, secret)
+        self.assertEqual(3, second.blocks_found)
+        self.assertEqual(first.block_ids, second.block_ids[1:])
+        self.assertEqual(3, updated.count(f"[{links.LINK_LABEL}]"))
+
+    def test_repairs_blank_line_between_managed_link_and_block_without_duplicating_link(self) -> None:
+        path = Path("/tmp/note.md")
+        secret = b"g" * 32
+        original, first = links.sync_text(
+            "```mermaid\nA-->B\n```\n",
+            path,
+            links.DEFAULT_ORIGIN,
+            secret,
+        )
+        detached = original.replace(")\n```mermaid", ")\n\n```mermaid")
+
+        repaired, second = links.sync_text(detached, path, links.DEFAULT_ORIGIN, secret)
+
+        self.assertEqual(1, second.blocks_changed)
+        self.assertEqual(first.block_ids, second.block_ids)
+        self.assertEqual(1, repaired.count(f"[{links.LINK_LABEL}]"))
+        self.assertIn(")\n```mermaid", repaired)
+
+    def test_rejects_tampered_signature_and_detached_link(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "note.md"
+            secret_path = Path(directory) / "secret"
+            path.write_text("```mermaid\nA-->B\n```\n", encoding="utf-8")
+            links.sync_file(path, secret_path=secret_path)
+            markdown = path.read_text(encoding="utf-8")
+            parsed = first_app_link(markdown)
+            secret = links.load_or_create_secret(secret_path, create=False)
+            replacement = "A" if parsed.signature[-1] != "A" else "B"
+
+            with self.assertRaises(links.SignatureError):
+                links.resolve_linked_diagram(parsed.token, parsed.signature[:-1] + replacement, secret)
+
+            path.write_text(markdown.replace(")\n```mermaid", ")\n\n```mermaid"), encoding="utf-8")
+            with self.assertRaisesRegex(links.LinkError, "正上方"):
+                links.resolve_linked_diagram(parsed.token, parsed.signature, secret)
+
+    def test_preserves_crlf(self) -> None:
+        source = "text\r\n```mermaid\r\nA-->B\r\n```\r\n"
+        updated, _ = links.sync_text(source, Path("/tmp/note.md"), links.DEFAULT_ORIGIN, b"c" * 32)
+        self.assertNotIn("\n", updated.replace("\r\n", ""))
+
+
+class HttpAdapterTests(unittest.TestCase):
+    def test_loaded_waiting_page_starts_injection_then_reports_redirect_url(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "note.md"
+            secret_path = Path(directory) / "secret"
+            port = free_port()
+            origin = f"http://127.0.0.1:{port}"
+            path.write_text("```mermaid\nA-->LatestFromDisk\n```\n", encoding="utf-8")
+            links.sync_file(path, origin=origin, secret_path=secret_path)
+            parsed = first_app_link(path.read_text(encoding="utf-8"))
+            secret = links.load_or_create_secret(secret_path, create=False)
+            captured: list[str] = []
+            config = links.injector.InjectConfig(
+                edit_url="https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit"
+            )
+            fake_result = links.injector.InjectResult(
+                reused_tab=True,
+                selector_description="fake editor",
+                preview_evidence="preview contains LatestFromDisk",
+                page_title="fake",
+                auto_update_enabled=True,
+            )
+
+            def fake_inject(
+                code: str,
+                _config: links.injector.InjectConfig,
+                target_marker: str | None,
+            ) -> links.injector.InjectResult:
+                captured.append(code)
+                self.assertIsNotNone(target_marker)
+                self.assertTrue(target_marker.startswith("mermaid-ai-inject="))
+                return fake_result
+
+            settings = links.ServerSettings(host="127.0.0.1", port=port)
+            bridge = links.MermaidBridge(
+                secret,
+                config,
+                inject=fake_inject,
+                preflight=lambda _config: None,
+                origin=origin,
+            )
+            server = links.ThreadingHTTPServer(
+                (settings.host, settings.port), links.make_http_handler(bridge, settings)
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with urllib.request.urlopen(parsed.url, timeout=3) as waiting_response:
+                    waiting_html = waiting_response.read().decode("utf-8")
+                    job_id = waiting_response.headers["X-Mermaid-AI-Job"]
+                    policies = waiting_response.headers.get_all("Content-Security-Policy")
+                self.assertIn("正在更新 Mermaid.ai", waiting_html)
+                self.assertIn("data.state==='failed'", waiting_html)
+                self.assertEqual(1, len(policies))
+                self.assertIn("script-src 'nonce-", policies[0])
+                self.assertEqual([], captured, "initial navigation must finish before CDP injection starts")
+
+                start_request = urllib.request.Request(
+                    f"{origin}/v1/jobs/{job_id}/start",
+                    data=b"",
+                    method="POST",
+                )
+                with urllib.request.urlopen(start_request, timeout=3) as started_response:
+                    self.assertEqual(202, started_response.status)
+                    started_job = links.json.loads(started_response.read().decode("utf-8"))
+                self.assertIn(f"#mermaid-ai-inject={job_id}", started_job["navigate_url"])
+
+                deadline = time.monotonic() + 3
+                job = {}
+                while time.monotonic() < deadline:
+                    with urllib.request.urlopen(f"{origin}/v1/jobs/{job_id}", timeout=3) as response:
+                        job = links.json.loads(response.read().decode("utf-8"))
+                    if job.get("state") in {"succeeded", "failed"}:
+                        break
+                    time.sleep(0.01)
+                self.assertEqual("succeeded", job.get("state"), job)
+                self.assertEqual(config.edit_url, job.get("edit_url"))
+                self.assertEqual(["A-->LatestFromDisk\n"], captured)
+
+                request = urllib.request.Request(parsed.url, method="HEAD")
+                with self.assertRaises(urllib.error.HTTPError) as head_error:
+                    urllib.request.urlopen(request, timeout=3)
+                self.assertEqual(405, head_error.exception.code)
+                self.assertEqual(1, len(captured), "HEAD/link preview must never inject")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=3)
+
+    def test_failed_injection_retries_then_replaces_stale_mermaid_page_with_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "note.md"
+            secret_path = Path(directory) / "secret"
+            port = free_port()
+            origin = f"http://127.0.0.1:{port}"
+            path.write_text("```mermaid\nA-->ExpectedDiagram\n```\n", encoding="utf-8")
+            links.sync_file(path, origin=origin, secret_path=secret_path)
+            parsed = first_app_link(path.read_text(encoding="utf-8"))
+            secret = links.load_or_create_secret(secret_path, create=False)
+            config = links.injector.InjectConfig(
+                edit_url="https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit"
+            )
+            attempts: list[tuple[str, str | None]] = []
+            presented_failures: list[tuple[str, str]] = []
+
+            def failing_inject(
+                code: str,
+                _config: links.injector.InjectConfig,
+                target_marker: str | None,
+            ) -> links.injector.InjectResult:
+                attempts.append((code, target_marker))
+                raise links.injector.BrowserError("Monaco 临时失去焦点")
+
+            def present_failure(
+                _config: links.injector.InjectConfig,
+                target_marker: str,
+                failure_url: str,
+            ) -> None:
+                presented_failures.append((target_marker, failure_url))
+
+            settings = links.ServerSettings(host="127.0.0.1", port=port)
+            bridge = links.MermaidBridge(
+                secret,
+                config,
+                inject=failing_inject,
+                present_failure=present_failure,
+                preflight=lambda _config: None,
+                origin=origin,
+                max_injection_attempts=2,
+                retry_delay_seconds=0,
+            )
+            server = links.ThreadingHTTPServer(
+                (settings.host, settings.port), links.make_http_handler(bridge, settings)
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with urllib.request.urlopen(parsed.url, timeout=3) as waiting_response:
+                    job_id = waiting_response.headers["X-Mermaid-AI-Job"]
+
+                start_request = urllib.request.Request(
+                    f"{origin}/v1/jobs/{job_id}/start",
+                    data=b"",
+                    method="POST",
+                )
+                urllib.request.urlopen(start_request, timeout=3).close()
+
+                deadline = time.monotonic() + 3
+                job: dict[str, object] = {}
+                while time.monotonic() < deadline:
+                    with urllib.request.urlopen(f"{origin}/v1/jobs/{job_id}", timeout=3) as response:
+                        job = links.json.loads(response.read().decode("utf-8"))
+                    if job.get("state") == "failed":
+                        break
+                    time.sleep(0.01)
+
+                self.assertEqual("failed", job.get("state"), job)
+                self.assertEqual(2, job.get("attempts"), job)
+                self.assertIn("Monaco 临时失去焦点", str(job.get("error")))
+                self.assertEqual(2, len(attempts))
+                expected_marker = f"mermaid-ai-inject={job_id}"
+                self.assertEqual([expected_marker, expected_marker], [item[1] for item in attempts])
+                self.assertEqual(1, len(presented_failures))
+                marker, failure_url = presented_failures[0]
+                self.assertEqual(expected_marker, marker)
+                self.assertEqual(f"{origin}/v1/jobs/{job_id}/failure", failure_url)
+
+                with urllib.request.urlopen(failure_url, timeout=3) as response:
+                    failure_html = response.read().decode("utf-8")
+                self.assertIn("Mermaid.ai 注入失败", failure_html)
+                self.assertIn("Monaco 临时失去焦点", failure_html)
+                self.assertIn("重新尝试", failure_html)
+                self.assertNotIn(config.edit_url, failure_html)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=3)
+
+    def test_transient_injection_failure_recovers_in_the_same_clicked_page(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "note.md"
+            secret_path = Path(directory) / "secret"
+            origin = f"http://127.0.0.1:{free_port()}"
+            path.write_text("```mermaid\nA-->ExpectedDiagram\n```\n", encoding="utf-8")
+            links.sync_file(path, origin=origin, secret_path=secret_path)
+            parsed = first_app_link(path.read_text(encoding="utf-8"))
+            secret = links.load_or_create_secret(secret_path, create=False)
+            config = links.injector.InjectConfig(
+                edit_url="https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit"
+            )
+            attempts: list[str | None] = []
+            presented_failures: list[str] = []
+            fake_result = links.injector.InjectResult(
+                reused_tab=True,
+                selector_description="fake editor",
+                preview_evidence="preview contains ExpectedDiagram",
+                page_title="fake",
+                auto_update_enabled=True,
+            )
+
+            def flaky_inject(
+                _code: str,
+                _config: links.injector.InjectConfig,
+                target_marker: str | None,
+            ) -> links.injector.InjectResult:
+                attempts.append(target_marker)
+                if len(attempts) == 1:
+                    raise links.injector.BrowserError("CDP transient disconnect")
+                return fake_result
+
+            bridge = links.MermaidBridge(
+                secret,
+                config,
+                inject=flaky_inject,
+                present_failure=lambda _config, _marker, url: presented_failures.append(url),
+                preflight=lambda _config: None,
+                origin=origin,
+                max_injection_attempts=2,
+                retry_delay_seconds=0,
+            )
+            created = bridge.create_job(parsed.token, parsed.signature)
+            bridge.start_job(created.job_id)
+
+            deadline = time.monotonic() + 3
+            snapshot = bridge.get_job(created.job_id)
+            while snapshot.state == "running" and time.monotonic() < deadline:
+                time.sleep(0.01)
+                snapshot = bridge.get_job(created.job_id)
+
+            self.assertEqual("succeeded", snapshot.state, snapshot)
+            self.assertEqual(2, snapshot.attempts)
+            self.assertEqual(2, len(attempts))
+            self.assertEqual([attempts[0]], [attempts[1]])
+            self.assertEqual([], presented_failures)
+
+    def test_preflight_failure_keeps_the_user_on_the_local_waiting_page(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "note.md"
+            secret_path = Path(directory) / "secret"
+            origin = f"http://127.0.0.1:{free_port()}"
+            path.write_text("```mermaid\nA-->B\n```\n", encoding="utf-8")
+            links.sync_file(path, origin=origin, secret_path=secret_path)
+            parsed = first_app_link(path.read_text(encoding="utf-8"))
+            secret = links.load_or_create_secret(secret_path, create=False)
+            config = links.injector.InjectConfig(
+                edit_url="https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit"
+            )
+            injected: list[str] = []
+            presented_failures: list[str] = []
+
+            def fail_preflight(_config: links.injector.InjectConfig) -> None:
+                raise links.injector.BrowserError("Chrome/CDP 不可用")
+
+            def should_not_inject(
+                code: str,
+                _config: links.injector.InjectConfig,
+                _marker: str | None,
+            ) -> links.injector.InjectResult:
+                injected.append(code)
+                raise AssertionError("preflight failure must prevent injection")
+
+            bridge = links.MermaidBridge(
+                secret,
+                config,
+                inject=should_not_inject,
+                present_failure=lambda _config, _marker, url: presented_failures.append(url),
+                preflight=fail_preflight,
+                origin=origin,
+            )
+            created = bridge.create_job(parsed.token, parsed.signature)
+            started = bridge.start_job(created.job_id)
+
+            self.assertEqual("failed", started.state)
+            self.assertEqual(0, started.attempts)
+            self.assertIn("Chrome/CDP 不可用", str(started.error))
+            self.assertEqual([], injected)
+            self.assertEqual([], presented_failures)
+
+
+class ManualLifecycleTests(unittest.TestCase):
+    def test_explicit_start_status_stop_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text(
+                "edit_url: https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit\nlaunch_if_needed: false\n",
+                encoding="utf-8",
+            )
+            settings = links.ServerSettings(
+                port=free_port(),
+                config_path=config,
+                secret_path=root / "secret",
+                state_dir=root / "state",
+            )
+            common = [
+                "--host",
+                settings.host,
+                "--port",
+                str(settings.port),
+                "--config",
+                str(settings.config_path),
+                "--secret-file",
+                str(settings.secret_path),
+                "--state-dir",
+                str(settings.state_dir),
+            ]
+            output = ""
+            try:
+                started = subprocess.run(
+                    [sys.executable, "-m", "mermaid_ai_links.links", "start", *common],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                output += started.stdout + started.stderr
+                self.assertEqual(0, started.returncode, output)
+                checked = subprocess.run(
+                    [sys.executable, "-m", "mermaid_ai_links.links", "status", *common],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                output += checked.stdout + checked.stderr
+                self.assertEqual(0, checked.returncode, output)
+                self.assertIsNotNone(links._health(settings))
+            finally:
+                stopped = subprocess.run(
+                    [sys.executable, "-m", "mermaid_ai_links.links", "stop", *common],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                output += stopped.stdout + stopped.stderr
+            self.assertIsNone(links._health(settings))
+            self.assertFalse(settings.pid_path.exists())
+            self.assertIn("链接服务已启动", output)
+            self.assertIn("链接服务已停止", output)
+
+
+if __name__ == "__main__":
+    unittest.main()

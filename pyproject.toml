@@ -1,0 +1,51 @@
+[project]
+name = "mermaid-ai-links"
+version = "0.1.0"
+description = "Open the latest Mermaid block from any Markdown file in a fixed Mermaid.ai scratch diagram."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+  { name = "Async23" },
+]
+keywords = ["mermaid", "markdown", "mcp", "typora", "vscode", "obsidian"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: MacOS X",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Documentation",
+]
+dependencies = [
+  "mcp>=1.28,<2",
+  "playwright>=1.61,<2",
+  "PyYAML>=6,<7",
+]
+
+[project.urls]
+Homepage = "https://github.com/Async23/mermaid-ai-links"
+Repository = "https://github.com/Async23/mermaid-ai-links"
+Issues = "https://github.com/Async23/mermaid-ai-links/issues"
+
+[project.scripts]
+mermaid-ai-links = "mermaid_ai_links.cli:main"
+inject-mermaid-ai = "mermaid_ai_links.injector:main"
+
+[dependency-groups]
+dev = [
+  "ruff>=0.15,<0.16",
+  "websocket-client>=1.8,<2",
+]
+
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mermaid_ai_links"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"

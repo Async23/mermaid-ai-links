@@ -1,0 +1,20 @@
+# Copy to ~/.config/mermaid-ai-inject/config.yaml (never commit the real file).
+edit_url: "https://mermaid.ai/app/projects/PROJECT_ID/diagrams/DIAGRAM_ID/version/v0.1/edit"
+
+# Connect to an already-running Chrome. For Markdown links, macOS external URLs
+# must open in this same Chrome instance so the bridge can identify the clicked
+# tab by its one-time fragment. The CLI never activates a tab itself.
+cdp_url: "http://127.0.0.1:9222"
+timeout_ms: 60000
+settle_ms: 1500
+
+# Background-safe default. Set true only if you accept a visible Chrome window
+# being launched when CDP is unavailable (needed once for interactive login).
+launch_if_needed: false
+browser_channel: chrome
+chrome_path: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+user_data_dir: "~/Library/Application Support/Google/Chrome-Mermaid-AI"
+headless: false
+
+# Emergency override if mermaid.ai changes its accessible editor label.
+# editor_selector: 'textarea[aria-label="Editor content"]'

@@ -1,0 +1,10 @@
+{
+  "id": "mermaid-ai-inject",
+  "name": "Mermaid.ai Inject",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Open the Mermaid block under the cursor in a fixed mermaid.ai scratch diagram.",
+  "author": "Async23",
+  "authorUrl": "https://github.com/Async23",
+  "isDesktopOnly": true
+}

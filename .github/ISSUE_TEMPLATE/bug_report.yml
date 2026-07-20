@@ -1,0 +1,65 @@
+name: Bug report
+description: Report reproducible incorrect behavior
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include credentials, cookies, HMAC secrets, signed local links,
+        personal file paths, or private Mermaid source. Report security issues
+        through the repository's private Security form.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: v0.1.0 or commit SHA
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS and Python versions
+      placeholder: macOS 15.x, Python 3.12.x
+    validations:
+      required: true
+  - type: dropdown
+    id: entrypoint
+    attributes:
+      label: Entry point
+      options:
+        - CLI
+        - Markdown HTTP link
+        - MCP
+        - Obsidian optional integration
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Use a minimal sanitized Markdown example.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and sanitized logs
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checks
+      options:
+        - label: I removed credentials, signed links, private paths, and private Mermaid content.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true
+
