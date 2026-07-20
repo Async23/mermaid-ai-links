@@ -54,8 +54,7 @@ jobs:
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           python-version: "3.12"
-          enable-cache: true
-          cache-dependency-glob: uv.lock
+          enable-cache: false
       - name: Install locked dependencies
         run: uv sync --locked --all-groups
       - name: Lint
@@ -64,4 +63,3 @@ jobs:
         run: uv run ruff format --check src tests
       - name: Build package
         run: uv build
-
