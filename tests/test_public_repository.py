@@ -14,7 +14,8 @@ PERSONAL_HOME_RE = re.compile(r"(?:/Users|/home)/[^/\s\"'`]+/")
 
 class PublicRepositoryTests(unittest.TestCase):
     def _public_markdown_files(self) -> list[Path]:
-        return [ROOT / "README.md", *(ROOT / "docs").rglob("*.md")]
+        docs = [path for path in (ROOT / "docs").rglob("*.md") if not path.name.endswith(".local.md")]
+        return [ROOT / "README.md", *docs]
 
     def test_public_markdown_has_no_signed_local_links(self) -> None:
         for path in self._public_markdown_files():
