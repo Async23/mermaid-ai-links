@@ -104,10 +104,18 @@ class McpProtocolTests(unittest.TestCase):
                     async with ClientSession(read, write) as session:
                         await session.initialize()
                         tools = await session.list_tools()
+                        by_name = {tool.name: tool for tool in tools.tools}
                         self.assertEqual(
                             {"doctor", "list_diagrams", "sync_document", "open_diagram"},
-                            {tool.name for tool in tools.tools},
+                            set(by_name),
                         )
+                        open_schema = by_name["open_diagram"].inputSchema
+                        open_props = open_schema["properties"]
+                        self.assertIn("Absolute or user-expanded path", open_props["document"]["description"])
+                        self.assertIn("exactly one of block_id or block_index", open_props["block_id"]["description"])
+                        self.assertIn("1-based index", open_props["block_index"]["description"])
+                        sync_props = by_name["sync_document"].inputSchema["properties"]
+                        self.assertIn("only verify managed links", sync_props["check_only"]["description"])
 
                         synced = structured(
                             await session.call_tool(

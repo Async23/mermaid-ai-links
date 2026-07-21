@@ -100,7 +100,7 @@ curl -fsS http://127.0.0.1:9222/json/version
 项目使用 `uv` 管理环境和命令入口，连接系统 Chrome，不下载 Playwright 自带浏览器。普通安装：
 
 ```zsh
-uv tool install git+https://github.com/Async23/mermaid-ai-links.git@v0.1.0
+uv tool install git+https://github.com/Async23/mermaid-ai-links.git@v0.1.1
 ```
 
 从源码开发：
@@ -119,7 +119,7 @@ mkdir -p ~/.config/mermaid-ai-inject
 CONFIG="$HOME/.config/mermaid-ai-inject/config.yaml"
 test -e "$CONFIG" || \
   curl -fsSL \
-    https://raw.githubusercontent.com/Async23/mermaid-ai-links/v0.1.0/config.example.yaml \
+    https://raw.githubusercontent.com/Async23/mermaid-ai-links/v0.1.1/config.example.yaml \
     -o "$CONFIG"
 chmod 600 ~/.config/mermaid-ai-inject/config.yaml
 ```
