@@ -22,9 +22,9 @@ flowchart TB
 同一个安装包提供三个入口，但只维护一套核心逻辑：
 
 ```text
-CLI  -> 人、脚本和 Agent Skill
+CLI  -> 人、脚本；也可被 AI 直接调用（可选自写 Agent Skill）
 HTTP -> Typora、VS Code、Obsidian 中的普通链接
-MCP  -> Codex、Claude、Cursor 等 AI Host
+MCP  -> Codex、Claude、Cursor 等 AI Host（自动发现 tools + 参数 schema）
              |
              v
 共享 Application Interface -> 唯一 HTTP Bridge -> Chrome / Mermaid.ai
@@ -124,7 +124,7 @@ test -e "$CONFIG" || \
 chmod 600 ~/.config/mermaid-ai-inject/config.yaml
 ```
 
-源码开发者也可以用 `cp config.example.yaml "$CONFIG"` 代替下载。只需把本地配置中的 `edit_url` 改成真实固定草稿 URL。Cookie、token、链接签名密钥和真实配置均不提交 Git。
+源码开发者也可以用 `cp config.example.yaml "$CONFIG"` 代替下载。`uv tool install` **不会**自动生成该文件；安装后必须自行创建，并把 `edit_url` 改成真实固定草稿 URL（其余字段都有默认值，最小可用配置可以只保留 `edit_url`）。Cookie、token、链接签名密钥和真实配置均不提交 Git。
 
 链接密钥首次同步时自动生成在：
 
@@ -218,14 +218,21 @@ Mermaid.ai 页面出现后会先覆盖“正在载入这条 Markdown 对应的 M
 
 ## 6. MCP 入口
 
-`mermaid-ai-links mcp` 通过 stdio 启动 MCP Adapter，提供四个工具：
+`mermaid-ai-links mcp` 通过 stdio 启动 MCP Adapter。仓库**不附带**现成 Agent Skill；AI 既可配置 MCP 自动发现工具，也可自行用 shell/`Skill` 调用同一套 CLI。
 
-```text
-doctor
-list_diagrams
-sync_document
-open_diagram
-```
+提供四个工具（参数说明也会进入 MCP `inputSchema`，供 AI Host 传参）：
+
+| Tool | 作用 | 参数 |
+|------|------|------|
+| `doctor` | 检查配置、密钥、Bridge、Chrome/CDP | 无 |
+| `list_diagrams` | 列出文档中的 Mermaid 块与链接状态 | `document`（必填，`.md` / `.markdown` 路径） |
+| `sync_document` | 为每个 Mermaid 块生成或校验唯一本机链接 | `document`（必填）；`check_only`（可选，默认 `false`，为 `true` 时只检查不写入） |
+| `open_diagram` | 打开一块图到共用 Mermaid.ai 草稿（会覆盖草稿） | `document`（必填）；`block_id` 与 `block_index`（**二选一**；`block_index` 从 1 开始，通常先 `list_diagrams`） |
+
+使用前提：
+
+- `doctor` / `list_diagrams` / `sync_document`：不依赖点击链路。
+- `open_diagram`：需要本机 HTTP Bridge 已在运行（先 `mermaid-ai-links start`），并复用同一套 Chrome/CDP。
 
 AI Host 的通用配置形态：
 
@@ -239,6 +246,8 @@ AI Host 的通用配置形态：
   }
 }
 ```
+
+若 Host 的 `PATH` 里找不到命令，把 `command` 改成本机绝对路径（例如 `~/.local/bin/mermaid-ai-links` 展开后的路径）。Codex / Grok 等 TOML 配置同理：`command` + `args = ["mcp"]`。
 
 stdio MCP 进程由 AI Host 启停；它不占用新的监听端口。`open_diagram` 会通过带派生认证令牌的本机控制请求复用已经运行的 HTTP Bridge，因此只有 Bridge 进程管理 Chrome 和串行注入锁。AI Host 关闭后 MCP 进程可以退出，Markdown 链接仍由常驻 Bridge 处理。
 
