@@ -229,10 +229,9 @@ class MermaidLinksApplication:
         lines = markdown.splitlines(keepends=True)
         diagrams: list[_ManagedDiagram] = []
         for block in blocks:
-            parsed: links.ParsedLink | None = None
             opening_index = block.opening_line - 1
-            if opening_index > 0:
-                parsed = links.parse_app_link_line(lines[opening_index - 1])
+            placement = links.find_managed_link_before(lines, opening_index)
+            parsed = placement.parsed if placement is not None else None
             linked = parsed is not None and parsed.block_id is not None
             diagrams.append(
                 _ManagedDiagram(

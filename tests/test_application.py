@@ -36,6 +36,8 @@ class ApplicationInterfaceTests(unittest.TestCase):
             )
 
             result = app.sync_document(note)
+            linked = note.read_text(encoding="utf-8")
+            note.write_text(linked.replace(")\n```mermaid", ")\n\n```mermaid", 1), encoding="utf-8")
             diagrams = app.list_diagrams(note)
 
             self.assertEqual(2, result.blocks_found)

@@ -115,7 +115,7 @@ sequenceDiagram
         self.assertEqual(1, repaired.count(f"[{links.LINK_LABEL}]"))
         self.assertIn(")\n```mermaid", repaired)
 
-    def test_rejects_tampered_signature_and_detached_link(self) -> None:
+    def test_resolves_link_across_blank_lines_without_writing_document(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "note.md"
             secret_path = Path(directory) / "secret"
@@ -124,14 +124,119 @@ sequenceDiagram
             markdown = path.read_text(encoding="utf-8")
             parsed = first_app_link(markdown)
             secret = links.load_or_create_secret(secret_path, create=False)
+
+            detached = markdown.replace(")\n```mermaid", ")\n\n  \n```mermaid")
+            path.write_text(detached, encoding="utf-8")
+
+            resolved = links.resolve_linked_diagram(parsed.token, parsed.signature, secret)
+
+            self.assertEqual("A-->B\n", resolved.code)
+            self.assertEqual(detached, path.read_text(encoding="utf-8"))
+
+    def test_rejects_tampered_signature(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "note.md"
+            secret_path = Path(directory) / "secret"
+            path.write_text("```mermaid\nA-->B\n```\n", encoding="utf-8")
+            links.sync_file(path, secret_path=secret_path)
+            parsed = first_app_link(path.read_text(encoding="utf-8"))
+            secret = links.load_or_create_secret(secret_path, create=False)
             replacement = "A" if parsed.signature[-1] != "A" else "B"
 
             with self.assertRaises(links.SignatureError):
                 links.resolve_linked_diagram(parsed.token, parsed.signature[:-1] + replacement, secret)
 
-            path.write_text(markdown.replace(")\n```mermaid", ")\n\n```mermaid"), encoding="utf-8")
-            with self.assertRaisesRegex(links.LinkError, "正上方"):
+    def test_content_gap_requires_explicit_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "note.md"
+            secret_path = Path(directory) / "secret"
+            path.write_text("```mermaid\nA-->B\n```\n", encoding="utf-8")
+            links.sync_file(path, secret_path=secret_path)
+            markdown = path.read_text(encoding="utf-8")
+            parsed = first_app_link(markdown)
+            secret = links.load_or_create_secret(secret_path, create=False)
+            detached = markdown.replace(")\n```mermaid", ")\n这里是正文\n```mermaid")
+            path.write_text(detached, encoding="utf-8")
+
+            with self.assertRaises(links.LinkPlacementError) as raised:
                 links.resolve_linked_diagram(parsed.token, parsed.signature, secret)
+
+            self.assertEqual("DETACHED_LINK", raised.exception.code)
+            self.assertTrue(raised.exception.repairable)
+            self.assertEqual(1, raised.exception.link_line)
+            self.assertEqual((3,), raised.exception.candidate_lines)
+            self.assertEqual(detached, path.read_text(encoding="utf-8"))
+
+    def test_explicit_repair_moves_unambiguous_link_and_resolves_latest_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "note.md"
+            secret_path = Path(directory) / "secret"
+            path.write_text("```mermaid\nA-->B\n```\n", encoding="utf-8")
+            links.sync_file(path, secret_path=secret_path)
+            markdown = path.read_text(encoding="utf-8")
+            parsed = first_app_link(markdown)
+            secret = links.load_or_create_secret(secret_path, create=False)
+            path.write_text(
+                markdown.replace(")\n```mermaid", ")\n保留这段说明\n```mermaid").replace("A-->B", "Latest-->Source"),
+                encoding="utf-8",
+            )
+            path.chmod(0o640)
+
+            resolved = links.repair_linked_diagram(parsed.token, parsed.signature, secret)
+            repaired = path.read_text(encoding="utf-8")
+
+            self.assertEqual("Latest-->Source\n", resolved.code)
+            self.assertIn("保留这段说明\n[↗ 在 Mermaid.ai 打开]", repaired)
+            self.assertIn(")\n```mermaid", repaired)
+            self.assertEqual(1, repaired.count(f"[{links.LINK_LABEL}]"))
+            self.assertEqual(0o640, path.stat().st_mode & 0o777)
+
+    def test_content_gap_with_multiple_following_blocks_remains_ambiguous(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "note.md"
+            secret_path = Path(directory) / "secret"
+            path.write_text("```mermaid\nA-->B\n```\n", encoding="utf-8")
+            links.sync_file(path, secret_path=secret_path)
+            markdown = path.read_text(encoding="utf-8")
+            parsed = first_app_link(markdown)
+            secret = links.load_or_create_secret(secret_path, create=False)
+            detached = markdown.replace(")\n```mermaid", ")\n这里是正文\n```mermaid")
+            detached += "\n```mermaid\nC-->D\n```\n"
+            path.write_text(detached, encoding="utf-8")
+
+            with self.assertRaises(links.LinkPlacementError) as raised:
+                links.resolve_linked_diagram(parsed.token, parsed.signature, secret)
+
+            self.assertEqual("AMBIGUOUS_LINK", raised.exception.code)
+            self.assertFalse(raised.exception.repairable)
+            self.assertEqual((3, 7), raised.exception.candidate_lines)
+            error_page = links._placement_error_page(raised.exception, None).body.decode("utf-8")
+            self.assertNotIn("自动修复并打开", error_page)
+            self.assertIn("复制修复命令", error_page)
+            with self.assertRaises(links.LinkPlacementError):
+                links.repair_linked_diagram(parsed.token, parsed.signature, secret)
+            self.assertEqual(detached, path.read_text(encoding="utf-8"))
+
+    def test_same_signed_link_on_multiple_blocks_is_rejected_as_ambiguous(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "note.md"
+            secret_path = Path(directory) / "secret"
+            path.write_text("```mermaid\nA-->B\n```\n\n```mermaid\nC-->D\n```\n", encoding="utf-8")
+            links.sync_file(path, secret_path=secret_path)
+            markdown = path.read_text(encoding="utf-8")
+            managed_lines = [line for line in markdown.splitlines(keepends=True) if links.parse_app_link_line(line)]
+            self.assertEqual(2, len(managed_lines))
+            duplicated = markdown.replace(managed_lines[1], managed_lines[0])
+            path.write_text(duplicated, encoding="utf-8")
+            parsed = first_app_link(duplicated)
+            secret = links.load_or_create_secret(secret_path, create=False)
+
+            with self.assertRaises(links.LinkPlacementError) as raised:
+                links.resolve_linked_diagram(parsed.token, parsed.signature, secret)
+
+            self.assertEqual("AMBIGUOUS_LINK", raised.exception.code)
+            self.assertFalse(raised.exception.repairable)
+            self.assertEqual((2, 7), raised.exception.candidate_lines)
 
     def test_preserves_crlf(self) -> None:
         source = "text\r\n```mermaid\r\nA-->B\r\n```\r\n"
@@ -140,6 +245,60 @@ sequenceDiagram
 
 
 class HttpAdapterTests(unittest.TestCase):
+    def test_actionable_error_page_repairs_only_after_explicit_post(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "note.md"
+            secret_path = root / "secret"
+            port = free_port()
+            origin = f"http://127.0.0.1:{port}"
+            path.write_text("```mermaid\nA-->B\n```\n", encoding="utf-8")
+            links.sync_file(path, origin=origin, secret_path=secret_path)
+            markdown = path.read_text(encoding="utf-8")
+            parsed = first_app_link(markdown)
+            detached = markdown.replace(")\n```mermaid", ")\n这里是正文\n```mermaid")
+            path.write_text(detached, encoding="utf-8")
+            secret = links.load_or_create_secret(secret_path, create=False)
+            settings = links.ServerSettings(host="127.0.0.1", port=port)
+            config = links.injector.InjectConfig(
+                edit_url="https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit"
+            )
+            bridge = links.MermaidBridge(
+                secret,
+                config,
+                preflight=lambda _config: None,
+                origin=origin,
+            )
+            server = links.ThreadingHTTPServer(
+                (settings.host, settings.port), links.make_http_handler(bridge, settings)
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            repair_url = f"{origin}/v1/repair/{parsed.token}.{parsed.signature}"
+            try:
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(parsed.url, timeout=3)
+                error_html = raised.exception.read().decode("utf-8")
+                self.assertEqual(409, raised.exception.code)
+                self.assertIn("链接与图表已分离", error_html)
+                self.assertIn("自动修复并打开", error_html)
+                self.assertIn("第 1 行", error_html)
+                self.assertIn("第 3 行", error_html)
+                self.assertIn("data-theme-toggle", error_html)
+                self.assertEqual(detached, path.read_text(encoding="utf-8"), "GET must not repair files")
+
+                repair_request = urllib.request.Request(repair_url, data=b"", method="POST")
+                with urllib.request.urlopen(repair_request, timeout=3) as response:
+                    waiting_html = response.read().decode("utf-8")
+                    self.assertEqual(200, response.status)
+                    self.assertIsNotNone(response.headers["X-Mermaid-AI-Job"])
+                self.assertIn("正在更新 Mermaid.ai", waiting_html)
+                self.assertIn("这里是正文\n[↗ 在 Mermaid.ai 打开]", path.read_text(encoding="utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=3)
+
     def test_loaded_waiting_page_starts_injection_then_reports_redirect_url(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "note.md"

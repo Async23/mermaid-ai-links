@@ -100,7 +100,7 @@ curl -fsS http://127.0.0.1:9222/json/version
 项目使用 `uv` 管理环境和命令入口，连接系统 Chrome，不下载 Playwright 自带浏览器。普通安装：
 
 ```zsh
-uv tool install git+https://github.com/Async23/mermaid-ai-links.git@v0.1.1
+uv tool install git+https://github.com/Async23/mermaid-ai-links.git@v0.2.0
 ```
 
 从源码开发：
@@ -119,12 +119,19 @@ mkdir -p ~/.config/mermaid-ai-inject
 CONFIG="$HOME/.config/mermaid-ai-inject/config.yaml"
 test -e "$CONFIG" || \
   curl -fsSL \
-    https://raw.githubusercontent.com/Async23/mermaid-ai-links/v0.1.1/config.example.yaml \
+    https://raw.githubusercontent.com/Async23/mermaid-ai-links/v0.2.0/config.example.yaml \
     -o "$CONFIG"
 chmod 600 ~/.config/mermaid-ai-inject/config.yaml
 ```
 
 源码开发者也可以用 `cp config.example.yaml "$CONFIG"` 代替下载。`uv tool install` **不会**自动生成该文件；安装后必须自行创建，并把 `edit_url` 改成真实固定草稿 URL（其余字段都有默认值，最小可用配置可以只保留 `edit_url`）。Cookie、token、链接签名密钥和真实配置均不提交 Git。
+
+也可以通过 npm/npx 使用同一套 Python 核心（仍需先安装 Python 3.11+ 与 `uv`）：
+
+```zsh
+npx -y mermaid-ai-links@0.2.0 --version
+npx -y mermaid-ai-links@0.2.0 doctor
+```
 
 链接密钥首次同步时自动生成在：
 
@@ -156,6 +163,8 @@ mermaid-ai-links list /absolute/path/to/note.md
 ```
 
 生成器支持反引号或波浪线 fence、多个 Mermaid 块、中文和 CRLF，并跳过嵌套在其他 fenced code block 中的伪 Mermaid 文本。重复执行是幂等的；若链接与代码块之间误加空行，同步器会收拢空行并保留原 `block_id`，不会再生成第二条链接。
+
+点击读取时也会容忍链接与 Mermaid fence 之间的纯空白行，且不会静默改写文档。若中间出现正文，只在目标唯一时提供显式的“自动修复并打开”；存在多个候选图时会停止并提示，避免打开错误内容。
 
 每条链接中的 `block_id` 是稳定标识：
 
@@ -248,6 +257,19 @@ AI Host 的通用配置形态：
 ```
 
 若 Host 的 `PATH` 里找不到命令，把 `command` 改成本机绝对路径（例如 `~/.local/bin/mermaid-ai-links` 展开后的路径）。Codex / Grok 等 TOML 配置同理：`command` + `args = ["mcp"]`。
+
+使用 npm 的 MCP 配置：
+
+```json
+{
+  "mcpServers": {
+    "mermaid-ai-links": {
+      "command": "npx",
+      "args": ["-y", "mermaid-ai-links@0.2.0", "mcp"]
+    }
+  }
+}
+```
 
 stdio MCP 进程由 AI Host 启停；它不占用新的监听端口。`open_diagram` 会通过带派生认证令牌的本机控制请求复用已经运行的 HTTP Bridge，因此只有 Bridge 进程管理 Chrome 和串行注入锁。AI Host 关闭后 MCP 进程可以退出，Markdown 链接仍由常驻 Bridge 处理。
 

@@ -63,3 +63,9 @@ jobs:
         run: uv run ruff format --check src tests
       - name: Build package
         run: uv build
+      - name: Test npm wrapper
+        working-directory: npm
+        run: npm test
+      - name: Check npm package contents
+        working-directory: npm
+        run: npm pack --dry-run

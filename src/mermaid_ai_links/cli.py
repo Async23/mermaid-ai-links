@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Sequence
 from urllib.parse import urlsplit
 
-from . import injector, links
+from . import __version__, injector, links
 from .application import ApplicationError, MermaidLinksApplication
 
 
@@ -42,6 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="mermaid-ai-links",
         description="通过 CLI、Markdown HTTP 链接和 MCP 打开最新 Mermaid 源码",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
 
     sync_parser = commands.add_parser("sync", help="给每个 Mermaid 块生成或修复唯一 App 链接")

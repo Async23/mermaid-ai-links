@@ -15,7 +15,9 @@ import json
 import os
 import re
 import secrets
+import shlex
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -44,6 +46,7 @@ MAX_MERMAID_CHARS = 1_000_000
 
 BLOCK_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 OPEN_PATH_RE = re.compile(r"^/v1/open/(?P<token>[A-Za-z0-9_-]+)\.(?P<signature>[A-Za-z0-9_-]+)$")
+REPAIR_PATH_RE = re.compile(r"^/v1/repair/(?P<token>[A-Za-z0-9_-]+)\.(?P<signature>[A-Za-z0-9_-]+)$")
 JOB_PATH_RE = re.compile(r"^/v1/jobs/(?P<job_id>[A-Za-z0-9_-]{32})$")
 JOB_START_PATH_RE = re.compile(r"^/v1/jobs/(?P<job_id>[A-Za-z0-9_-]{32})/start$")
 JOB_FAILURE_PATH_RE = re.compile(r"^/v1/jobs/(?P<job_id>[A-Za-z0-9_-]{32})/failure$")
@@ -67,6 +70,27 @@ class SignatureError(LinkError):
     """The request was not produced by this machine's link generator."""
 
 
+class LinkPlacementError(LinkError):
+    """A valid signed link cannot be associated with exactly one Mermaid block."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        path: Path,
+        link_line: int | None = None,
+        candidate_lines: tuple[int, ...] = (),
+        repairable: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.path = path
+        self.link_line = link_line
+        self.candidate_lines = candidate_lines
+        self.repairable = repairable
+
+
 class BridgeError(RuntimeError):
     """The local bridge could not complete a requested injection."""
 
@@ -83,6 +107,13 @@ class ParsedLink:
     token: str
     signature: str
     block_id: str | None
+
+
+@dataclass(frozen=True)
+class ManagedLinkPlacement:
+    parsed: ParsedLink
+    line_index: int
+    blank_lines: int
 
 
 @dataclass(frozen=True)
@@ -139,6 +170,20 @@ class _BridgeJob:
     attempts: int = 0
     result: BridgeOpenResult | None = None
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class HtmlPage:
+    body: bytes
+    content_security_policy: str
+
+
+@dataclass(frozen=True)
+class _LinkedDocument:
+    path: Path
+    markdown: str
+    blocks: tuple[injector.MermaidBlock, ...]
+    lines: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -300,15 +345,35 @@ def _line_ending(line: str) -> str:
     return "\n"
 
 
+def _previous_nonblank_index(lines: Sequence[str], cursor: int) -> int | None:
+    candidate = cursor - 1
+    while candidate >= 0 and not lines[candidate].strip():
+        candidate -= 1
+    return candidate if candidate >= 0 else None
+
+
+def find_managed_link_before(lines: Sequence[str], opening_index: int) -> ManagedLinkPlacement | None:
+    """Find the nearest managed link across whitespace-only lines."""
+    candidate = _previous_nonblank_index(lines, opening_index)
+    if candidate is None:
+        return None
+    parsed = parse_app_link_line(lines[candidate])
+    if parsed is None:
+        return None
+    return ManagedLinkPlacement(
+        parsed=parsed,
+        line_index=candidate,
+        blank_lines=opening_index - candidate - 1,
+    )
+
+
 def _managed_link_start(lines: list[str], opening_index: int) -> tuple[int, str | None]:
     start = opening_index
     existing_id: str | None = None
     cursor = opening_index
     while cursor > 0:
-        candidate = cursor - 1
-        while candidate >= 0 and not lines[candidate].strip():
-            candidate -= 1
-        if candidate < 0:
+        candidate = _previous_nonblank_index(lines, cursor)
+        if candidate is None:
             break
         previous = lines[candidate]
         parsed = parse_app_link_line(previous)
@@ -387,8 +452,7 @@ def sync_file(
     return result
 
 
-def resolve_linked_diagram(token: str, signature: str, secret: bytes) -> LinkedDiagram:
-    payload = decode_verified_link(token, signature, secret)
+def _load_linked_document(payload: LinkPayload) -> _LinkedDocument:
     try:
         path = payload.document_path.expanduser().resolve(strict=True)
     except (OSError, RuntimeError) as exc:
@@ -411,32 +475,162 @@ def resolve_linked_diagram(token: str, signature: str, secret: bytes) -> LinkedD
         blocks = injector.extract_mermaid_blocks(markdown)
     except injector.SourceError as exc:
         raise LinkError(str(exc)) from exc
-    lines = markdown.splitlines(keepends=True)
-    matches: list[LinkedDiagram] = []
-    for block in blocks:
-        opening_index = block.opening_line - 1
-        if opening_index == 0:
-            continue
-        parsed = parse_app_link_line(lines[opening_index - 1])
-        if parsed and parsed.token == token and parsed.signature == signature:
-            matches.append(
-                LinkedDiagram(
-                    path=path,
-                    block_id=payload.block_id,
-                    block_index=block.index,
-                    code=block.code,
-                )
-            )
-    if not matches:
-        raise LinkError("链接已不在对应 Mermaid 代码块正上方；请重新运行 mermaid-ai-links sync")
-    if len(matches) > 1:
-        raise LinkError("同一个 block_id 出现多次；请重新运行 mermaid-ai-links sync 去重")
-    diagram = matches[0]
+    return _LinkedDocument(
+        path=path,
+        markdown=markdown,
+        blocks=tuple(blocks),
+        lines=tuple(markdown.splitlines(keepends=True)),
+    )
+
+
+def _same_link(parsed: ParsedLink, token: str, signature: str) -> bool:
+    return parsed.token == token and parsed.signature == signature
+
+
+def _validate_diagram(diagram: LinkedDiagram) -> LinkedDiagram:
     if not diagram.code.strip():
         raise LinkError("对应 Mermaid 代码块为空")
     if len(diagram.code) > MAX_MERMAID_CHARS:
         raise LinkError(f"Mermaid 源码超过 {MAX_MERMAID_CHARS} chars 安全上限")
     return diagram
+
+
+def _resolve_from_document(
+    document: _LinkedDocument,
+    payload: LinkPayload,
+    token: str,
+    signature: str,
+) -> LinkedDiagram:
+    matches: list[LinkedDiagram] = []
+    for block in document.blocks:
+        opening_index = block.opening_line - 1
+        placement = find_managed_link_before(document.lines, opening_index)
+        if placement and _same_link(placement.parsed, token, signature):
+            matches.append(
+                LinkedDiagram(
+                    path=document.path,
+                    block_id=payload.block_id,
+                    block_index=block.index,
+                    code=block.code,
+                )
+            )
+    if len(matches) > 1:
+        raise LinkPlacementError(
+            "同一条链接对应多张 Mermaid 图，无法安全判断目标；请运行 sync 去重。",
+            code="AMBIGUOUS_LINK",
+            path=document.path,
+            candidate_lines=tuple(document.blocks[item.block_index - 1].opening_line for item in matches),
+        )
+    if matches:
+        return _validate_diagram(matches[0])
+
+    link_indices = tuple(
+        index
+        for index, line in enumerate(document.lines)
+        if (parsed := parse_app_link_line(line)) is not None and _same_link(parsed, token, signature)
+    )
+    if len(link_indices) == 1:
+        link_line = link_indices[0] + 1
+        candidate_blocks = tuple(block for block in document.blocks if block.opening_line > link_line)
+        candidate_lines = tuple(block.opening_line for block in candidate_blocks)
+        target_is_unclaimed = False
+        if len(candidate_blocks) == 1:
+            target = candidate_blocks[0]
+            placement = find_managed_link_before(document.lines, target.opening_line - 1)
+            target_is_unclaimed = placement is None
+        if len(candidate_blocks) == 1 and target_is_unclaimed:
+            raise LinkPlacementError(
+                f"链接位于第 {link_line} 行，候选 Mermaid 图位于第 {candidate_lines[0]} 行；"
+                "两者之间含有正文，需确认后修复。",
+                code="DETACHED_LINK",
+                path=document.path,
+                link_line=link_line,
+                candidate_lines=candidate_lines,
+                repairable=True,
+            )
+        raise LinkPlacementError(
+            f"链接位于第 {link_line} 行，但下方有 {len(candidate_lines)} 个候选 Mermaid 图，无法安全判断目标。",
+            code="AMBIGUOUS_LINK",
+            path=document.path,
+            link_line=link_line,
+            candidate_lines=candidate_lines,
+        )
+    if len(link_indices) > 1:
+        raise LinkPlacementError(
+            "同一条链接在文档中出现多次，无法安全判断目标。",
+            code="AMBIGUOUS_LINK",
+            path=document.path,
+        )
+    raise LinkPlacementError(
+        "文档中已找不到这条 Mermaid.ai 链接；请重新运行 sync。",
+        code="LINK_NOT_FOUND",
+        path=document.path,
+    )
+
+
+def resolve_linked_diagram(token: str, signature: str, secret: bytes) -> LinkedDiagram:
+    payload = decode_verified_link(token, signature, secret)
+    document = _load_linked_document(payload)
+    return _resolve_from_document(document, payload, token, signature)
+
+
+def _replace_document_if_unchanged(path: Path, expected: str, updated: str) -> None:
+    try:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            current = handle.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise LinkError(f"修复前无法重新读取 Markdown 文件 {path}: {exc}") from exc
+    if current != expected:
+        raise LinkError("Markdown 文件在修复确认后又发生了变化；请重新点击链接")
+
+    temporary_path = path.with_name(f".{path.name}.mermaid-ai-links-{secrets.token_hex(8)}.tmp")
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+        descriptor = os.open(temporary_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+            handle.write(updated)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_path, mode)
+        os.replace(temporary_path, path)
+    except OSError as exc:
+        raise LinkError(f"无法安全修复 Markdown 文件 {path}: {exc}") from exc
+    finally:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def repair_linked_diagram(token: str, signature: str, secret: bytes) -> LinkedDiagram:
+    """Move one unambiguous detached link directly above its Mermaid block."""
+    payload = decode_verified_link(token, signature, secret)
+    document = _load_linked_document(payload)
+    try:
+        return _resolve_from_document(document, payload, token, signature)
+    except LinkPlacementError as exc:
+        if not exc.repairable or exc.link_line is None or len(exc.candidate_lines) != 1:
+            raise
+        link_index = exc.link_line - 1
+        opening_index = exc.candidate_lines[0] - 1
+
+    parsed = parse_app_link_line(document.lines[link_index])
+    if parsed is None or not _same_link(parsed, token, signature):
+        raise LinkError("待修复链接已发生变化；请重新点击")
+
+    lines = list(document.lines)
+    lines.pop(link_index)
+    if link_index < opening_index:
+        opening_index -= 1
+    opening_line = lines[opening_index]
+    indent_match = re.match(r"^[ \t]{0,3}", opening_line)
+    indent = indent_match.group(0) if indent_match else ""
+    link_line = f"{indent}[{LINK_LABEL}]({parsed.url}){_line_ending(opening_line)}"
+    lines.insert(opening_index, link_line)
+    _replace_document_if_unchanged(document.path, document.markdown, "".join(lines))
+    return resolve_linked_diagram(token, signature, secret)
 
 
 class MermaidBridge:
@@ -544,6 +738,10 @@ class MermaidBridge:
             self._cleanup_jobs_locked()
             self._jobs[job.job_id] = job
         return self._snapshot(job)
+
+    def repair_and_create_job(self, token: str, signature: str) -> JobSnapshot:
+        repair_linked_diagram(token, signature, self._secret)
+        return self.create_job(token, signature)
 
     def start_job(self, job_id: str) -> JobSnapshot:
         with self._jobs_lock:
@@ -674,51 +872,154 @@ class MermaidBridge:
         )
 
 
-def _html_page(title: str, message: str) -> bytes:
-    return (
-        '<!doctype html><html lang="zh-CN"><meta charset="utf-8">'
+def _render_page(title: str, content: str, page_script: str = "") -> HtmlPage:
+    nonce = secrets.token_urlsafe(18)
+    script = (
+        "const themeModes=['light','dark','auto'];"
+        "const themeIcons={light:'✹',dark:'☾',auto:'◑'};"
+        "const themeNames={light:'明亮',dark:'暗色',auto:'跟随系统'};"
+        "const themeButton=document.querySelector('[data-theme-toggle]');"
+        "let themeMode='auto';"
+        "try{const saved=localStorage.getItem('mermaid-ai-links-theme');"
+        "if(themeModes.includes(saved))themeMode=saved;}catch(_error){}"
+        "function applyTheme(mode){themeMode=mode;document.documentElement.dataset.theme=mode;"
+        "themeButton.textContent=themeIcons[mode];"
+        "themeButton.title='当前模式：'+themeNames[mode];"
+        "themeButton.setAttribute('aria-label','当前模式：'+themeNames[mode]+'；点击切换');}"
+        "themeButton.addEventListener('click',()=>{"
+        "const next=themeModes[(themeModes.indexOf(themeMode)+1)%themeModes.length];"
+        "try{localStorage.setItem('mermaid-ai-links-theme',next);}catch(_error){}"
+        "applyTheme(next);});"
+        "applyTheme(themeMode);"
+        f"{page_script}"
+    )
+    body = (
+        '<!doctype html><html lang="zh-CN" data-theme="auto"><head><meta charset="utf-8">'
         f"<title>{html.escape(title)}</title>"
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
-        "<style>body{font:16px/1.6 system-ui;max-width:760px;margin:10vh auto;padding:0 24px}"
-        "code{overflow-wrap:anywhere}h1{font-size:1.35rem}</style>"
-        f"<h1>{html.escape(title)}</h1><p>{html.escape(message)}</p></html>"
+        "<style>"
+        ":root{color-scheme:light;--bg:#f5f6f8;--surface:#fff;--text:#172033;--muted:#5f6878;"
+        "--border:#d9deea;--soft:#eef1f6;--accent:#3157d5;--accent-text:#fff;--focus:#1849c6;"
+        "--shadow:#1720331c}"
+        ":root[data-theme=dark]{color-scheme:dark;--bg:#11141a;--surface:#191e27;--text:#f2f4f8;"
+        "--muted:#b1bac9;--border:#343c4b;--soft:#242b36;--accent:#87a5ff;--accent-text:#101725;"
+        "--focus:#a8bcff;--shadow:#0008}"
+        "@media(prefers-color-scheme:dark){:root:not([data-theme=light]){color-scheme:dark;--bg:#11141a;"
+        "--surface:#191e27;--text:#f2f4f8;--muted:#b1bac9;--border:#343c4b;--soft:#242b36;"
+        "--accent:#87a5ff;--accent-text:#101725;--focus:#a8bcff;--shadow:#0008}}"
+        "*{box-sizing:border-box}body{margin:0;min-height:100vh;background:var(--bg);color:var(--text);"
+        "font:16px/1.65 system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
+        "padding:clamp(24px,7vw,72px) 24px}main{width:min(100%,720px);margin:6vh auto 0;"
+        "background:var(--surface);border:1px solid var(--border);border-radius:14px;"
+        "padding:clamp(24px,5vw,42px);box-shadow:0 18px 46px var(--shadow)}"
+        "h1{margin:0 0 14px;font-size:clamp(1.45rem,3vw,2rem);line-height:1.25;letter-spacing:-.025em}"
+        "p{margin:10px 0;color:var(--muted)}strong{color:var(--text)}"
+        "code{overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}"
+        ".detail{display:block;margin-top:18px;padding:13px 15px;background:var(--soft);border-radius:10px;"
+        "color:var(--text)}.location{color:var(--text);font-weight:600}.actions{display:flex;flex-wrap:wrap;"
+        "gap:10px;margin-top:24px}.actions form{margin:0}.button,button.button{appearance:none;display:inline-flex;"
+        "align-items:center;justify-content:center;min-height:42px;padding:9px 15px;border-radius:9px;"
+        "border:1px solid var(--border);font:inherit;font-weight:650;text-decoration:none;cursor:pointer;"
+        "background:var(--surface);color:var(--text)}.button.primary,button.button.primary{"
+        "background:var(--accent);border-color:var(--accent);color:var(--accent-text)}"
+        ".button:hover,button.button:hover{filter:brightness(.96)}"
+        ".button:focus-visible,button:focus-visible,summary:focus-visible{outline:3px solid var(--focus);"
+        "outline-offset:3px}.muted{color:var(--muted)}details{margin-top:22px;color:var(--muted)}"
+        "summary{cursor:pointer;font-weight:600;color:var(--text)}"
+        ".theme-toggle{position:fixed;inset-block-start:18px;inset-inline-end:18px;width:42px;height:42px;"
+        "padding:0;border:1px solid var(--border);border-radius:50%;background:var(--surface);color:var(--text);"
+        "font:20px/1 system-ui;box-shadow:0 8px 22px var(--shadow);cursor:pointer}"
+        "@media(max-width:520px){body{padding-inline:14px}main{margin-top:8vh}.actions{display:grid}"
+        ".button,button.button{width:100%}}"
+        "</style></head><body>"
+        '<button class="theme-toggle" type="button" data-theme-toggle title="当前模式：跟随系统" '
+        'aria-label="当前模式：跟随系统；点击切换">◑</button>'
+        f"<main>{content}</main>"
+        f'<script nonce="{nonce}">{script}</script></body></html>'
     ).encode("utf-8")
+    return HtmlPage(
+        body=body,
+        content_security_policy=(
+            f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; "
+            "connect-src 'self'; form-action 'self'; base-uri 'none'"
+        ),
+    )
 
 
-def _failure_page(snapshot: JobSnapshot) -> bytes:
+def _html_page(title: str, message: str) -> HtmlPage:
+    return _render_page(
+        title,
+        f"<h1>{html.escape(title)}</h1><p>{html.escape(message)}</p>",
+    )
+
+
+def _failure_page(snapshot: JobSnapshot) -> HtmlPage:
     error = snapshot.error or "未知错误"
     retry_url = snapshot.retry_url or "#"
-    return (
-        '<!doctype html><html lang="zh-CN"><meta charset="utf-8">'
-        "<title>Mermaid.ai 注入失败</title>"
-        '<meta name="viewport" content="width=device-width,initial-scale=1">'
-        "<style>body{font:16px/1.65 system-ui;max-width:760px;margin:10vh auto;padding:0 24px;"
-        "color:#172033;background:#f7f8fb}main{background:#fff;border:1px solid #d9deea;border-radius:14px;"
-        "padding:26px;box-shadow:0 12px 35px #18233b18}h1{font-size:1.35rem;margin-top:0}"
-        "code{display:block;overflow-wrap:anywhere;background:#f1f3f8;padding:12px;border-radius:8px}"
-        "a{display:inline-block;margin-top:8px;padding:9px 14px;border-radius:8px;background:#3659e3;color:#fff;"
-        "text-decoration:none}</style><main>"
+    return _render_page(
+        "Mermaid.ai 注入失败",
         "<h1>Mermaid.ai 注入失败</h1>"
         "<p>没有继续展示共用草稿中的旧图。你可以直接重新尝试本次链接。</p>"
-        f"<code>{html.escape(error)}</code>"
-        f'<a href="{html.escape(retry_url, quote=True)}">重新尝试</a>'
-        "</main></html>"
-    ).encode("utf-8")
+        f'<code class="detail">{html.escape(error)}</code>'
+        '<div class="actions">'
+        f'<a class="button primary" href="{html.escape(retry_url, quote=True)}">重新尝试</a>'
+        "</div>",
+    )
 
 
-def _waiting_page(job_id: str) -> tuple[bytes, str]:
-    nonce = secrets.token_urlsafe(18)
+def _placement_error_page(error: LinkPlacementError, repair_url: str | None) -> HtmlPage:
+    title = {
+        "DETACHED_LINK": "链接与图表已分离",
+        "AMBIGUOUS_LINK": "无法确定要打开哪张图",
+        "LINK_NOT_FOUND": "文档中的链接已变化",
+    }.get(error.code, "无法读取 Mermaid")
+    locations: list[str] = []
+    if error.link_line is not None:
+        locations.append(f"链接：第 {error.link_line} 行")
+    if error.candidate_lines:
+        label = "候选图" if len(error.candidate_lines) == 1 else "候选图"
+        locations.append(f"{label}：" + "、".join(f"第 {line} 行" for line in error.candidate_lines))
+    location_html = (
+        f'<p class="location">{" · ".join(html.escape(item) for item in locations)}</p>' if locations else ""
+    )
+    command = shlex.join(["mermaid-ai-links", "sync", str(error.path)])
+    actions = '<div class="actions">'
+    if error.repairable and repair_url:
+        actions += (
+            f'<form method="post" action="{html.escape(repair_url, quote=True)}">'
+            '<button class="button primary" type="submit">自动修复并打开</button></form>'
+        )
+    actions += (
+        f'<button class="button" type="button" data-copy-command '
+        f'data-command="{html.escape(command, quote=True)}">复制修复命令</button></div>'
+    )
+    details = (
+        "<details><summary>查看技术详情</summary>"
+        f'<code class="detail">{html.escape(error.code)}<br/>{html.escape(str(error.path))}</code>'
+        "</details>"
+    )
+    copy_script = (
+        "const copyButton=document.querySelector('[data-copy-command]');"
+        "if(copyButton){copyButton.addEventListener('click',async()=>{"
+        "const original=copyButton.textContent;try{await navigator.clipboard.writeText(copyButton.dataset.command);"
+        "copyButton.textContent='已复制';}catch(_error){copyButton.textContent='复制失败，请展开技术详情';}"
+        "setTimeout(()=>{copyButton.textContent=original;},1800);});}"
+    )
+    return _render_page(
+        title,
+        f"<h1>{html.escape(title)}</h1><p>{html.escape(str(error))}</p>{location_html}{actions}{details}",
+        copy_script,
+    )
+
+
+def _waiting_page(job_id: str) -> HtmlPage:
     job_json = json.dumps(job_id)
-    body = (
-        '<!doctype html><html lang="zh-CN"><meta charset="utf-8">'
-        "<title>正在打开 Mermaid.ai</title>"
-        '<meta name="viewport" content="width=device-width,initial-scale=1">'
-        "<style>body{font:16px/1.6 system-ui;max-width:760px;margin:10vh auto;padding:0 24px}"
-        "h1{font-size:1.35rem}.muted{color:#666}</style>"
+    content = (
         "<h1>正在更新 Mermaid.ai…</h1>"
-        '<p id="status">正在读取当前 Markdown 中的 Mermaid 源码。</p>'
+        '<p id="status" role="status" aria-live="polite">正在读取当前 Markdown 中的 Mermaid 源码。</p>'
         '<p class="muted">完成后会自动跳转，无需再次点击。</p>'
-        f'<script nonce="{nonce}">'
+    )
+    page_script = (
         f"const jobId={job_json};"
         "const statusNode=document.getElementById('status');"
         "async function readJson(response){"
@@ -735,9 +1036,8 @@ def _waiting_page(job_id: str) -> tuple[bytes, str]:
         "catch(error){document.title='Mermaid.ai 注入失败';"
         "statusNode.textContent='注入失败：'+error.message;}}"
         "window.addEventListener('DOMContentLoaded',run);"
-        "</script></html>"
-    ).encode("utf-8")
-    return body, nonce
+    )
+    return _render_page("正在打开 Mermaid.ai", content, page_script)
 
 
 def make_http_handler(bridge: MermaidBridge, settings: ServerSettings) -> type[BaseHTTPRequestHandler]:
@@ -763,6 +1063,14 @@ def make_http_handler(bridge: MermaidBridge, settings: ServerSettings) -> type[B
             self.end_headers()
             if self.command != "HEAD":
                 self.wfile.write(body)
+
+        def _send_page(self, status: HTTPStatus, page: HtmlPage, **headers: str) -> None:
+            self._send(
+                status,
+                page.body,
+                Content_Security_Policy=page.content_security_policy,
+                **headers,
+            )
 
         def _send_json(self, status: HTTPStatus, value: dict[str, object]) -> None:
             body = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -833,7 +1141,7 @@ def make_http_handler(bridge: MermaidBridge, settings: ServerSettings) -> type[B
 
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler interface
             if not self._host_is_allowed():
-                self._send(
+                self._send_page(
                     HTTPStatus.BAD_REQUEST,
                     _html_page("请求被拒绝", "Host header 不是本机链接服务"),
                 )
@@ -865,37 +1173,46 @@ def make_http_handler(bridge: MermaidBridge, settings: ServerSettings) -> type[B
                 try:
                     snapshot = bridge.get_job(failure_match.group("job_id"))
                 except LinkError as exc:
-                    self._send(HTTPStatus.NOT_FOUND, _html_page("注入任务已过期", str(exc)))
+                    self._send_page(HTTPStatus.NOT_FOUND, _html_page("注入任务已过期", str(exc)))
                     return
                 if snapshot.state != "failed":
-                    self._send(
+                    self._send_page(
                         HTTPStatus.CONFLICT,
                         _html_page("注入任务尚未失败", f"当前状态：{snapshot.state}"),
                     )
                     return
-                self._send(HTTPStatus.OK, _failure_page(snapshot))
+                self._send_page(HTTPStatus.OK, _failure_page(snapshot))
                 return
             path_match = OPEN_PATH_RE.fullmatch(parsed.path)
             if not path_match or parsed.query or parsed.fragment:
-                self._send(HTTPStatus.NOT_FOUND, _html_page("链接无效", "没有匹配的 Mermaid.ai 本机链接"))
+                self._send_page(
+                    HTTPStatus.NOT_FOUND,
+                    _html_page("链接无效", "没有匹配的 Mermaid.ai 本机链接"),
+                )
                 return
+            token = path_match.group("token")
+            signature = path_match.group("signature")
             try:
-                job = bridge.create_job(path_match.group("token"), path_match.group("signature"))
+                job = bridge.create_job(token, signature)
             except SignatureError as exc:
                 print(f"signature error: {exc}", file=sys.stderr, flush=True)
-                self._send(HTTPStatus.FORBIDDEN, _html_page("链接签名无效", str(exc)))
+                self._send_page(HTTPStatus.FORBIDDEN, _html_page("链接签名无效", str(exc)))
+                return
+            except LinkPlacementError as exc:
+                print(f"link placement error [{exc.code}]: {exc}", file=sys.stderr, flush=True)
+                repair_url = f"{settings.origin}/v1/repair/{token}.{signature}" if exc.repairable else None
+                self._send_page(
+                    HTTPStatus.CONFLICT,
+                    _placement_error_page(exc, repair_url),
+                )
                 return
             except LinkError as exc:
                 print(f"link error: {exc}", file=sys.stderr, flush=True)
-                self._send(HTTPStatus.BAD_REQUEST, _html_page("无法读取 Mermaid", str(exc)))
+                self._send_page(HTTPStatus.BAD_REQUEST, _html_page("无法读取 Mermaid", str(exc)))
                 return
-            body, nonce = _waiting_page(job.job_id)
-            self._send(
+            self._send_page(
                 HTTPStatus.OK,
-                body,
-                Content_Security_Policy=(
-                    f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; connect-src 'self'"
-                ),
+                _waiting_page(job.job_id),
                 X_Mermaid_AI_Job=job.job_id,
             )
 
@@ -904,6 +1221,31 @@ def make_http_handler(bridge: MermaidBridge, settings: ServerSettings) -> type[B
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Host header 不是本机链接服务"})
                 return
             parsed = urlsplit(self.path)
+            repair_match = REPAIR_PATH_RE.fullmatch(parsed.path)
+            if repair_match and not parsed.query and not parsed.fragment:
+                token = repair_match.group("token")
+                signature = repair_match.group("signature")
+                try:
+                    job = bridge.repair_and_create_job(token, signature)
+                except SignatureError as exc:
+                    self._send_page(HTTPStatus.FORBIDDEN, _html_page("链接签名无效", str(exc)))
+                    return
+                except LinkPlacementError as exc:
+                    repair_url = f"{settings.origin}/v1/repair/{token}.{signature}" if exc.repairable else None
+                    self._send_page(
+                        HTTPStatus.CONFLICT,
+                        _placement_error_page(exc, repair_url),
+                    )
+                    return
+                except LinkError as exc:
+                    self._send_page(HTTPStatus.BAD_REQUEST, _html_page("自动修复失败", str(exc)))
+                    return
+                self._send_page(
+                    HTTPStatus.OK,
+                    _waiting_page(job.job_id),
+                    X_Mermaid_AI_Job=job.job_id,
+                )
+                return
             if parsed.path == CONTROL_OPEN_PATH and not parsed.query and not parsed.fragment:
                 if not self._control_is_authorized():
                     self._send_json(HTTPStatus.FORBIDDEN, {"error": "控制请求认证失败"})

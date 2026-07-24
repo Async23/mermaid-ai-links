@@ -1,0 +1,44 @@
+{
+  "name": "mermaid-ai-links",
+  "version": "0.2.0",
+  "description": "Open the latest Mermaid block from Markdown in a shared Mermaid.ai scratch diagram.",
+  "type": "module",
+  "bin": {
+    "mermaid-ai-links": "bin/mermaid-ai-links.mjs"
+  },
+  "files": [
+    "bin/",
+    "python/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "prepack": "node scripts/stage-python.mjs",
+    "postpack": "node scripts/stage-python.mjs --clean"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mermaid",
+    "markdown",
+    "mcp",
+    "mermaid-ai",
+    "typora",
+    "obsidian"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Async23/mermaid-ai-links.git",
+    "directory": "npm"
+  },
+  "bugs": {
+    "url": "https://github.com/Async23/mermaid-ai-links/issues"
+  },
+  "homepage": "https://github.com/Async23/mermaid-ai-links#readme",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
+}

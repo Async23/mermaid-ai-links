@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import re
+import tomllib
 import unittest
 from pathlib import Path
+
+from mermaid_ai_links import __version__
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +36,13 @@ class PublicRepositoryTests(unittest.TestCase):
     def test_public_c4_keeps_the_three_mermaid_blocks(self) -> None:
         content = (ROOT / "docs" / "C4.md").read_text(encoding="utf-8")
         self.assertEqual(content.count("```mermaid\n"), 3)
+
+    def test_python_and_npm_versions_match(self) -> None:
+        project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        npm_package = json.loads((ROOT / "npm" / "package.json").read_text(encoding="utf-8"))
+        self.assertEqual("0.2.0", __version__)
+        self.assertEqual(__version__, project["project"]["version"])
+        self.assertEqual(__version__, npm_package["version"])
 
 
 if __name__ == "__main__":

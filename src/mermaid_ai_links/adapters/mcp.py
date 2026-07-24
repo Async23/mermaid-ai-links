@@ -44,10 +44,7 @@ def create_server(application: MermaidLinksApplication | None = None) -> FastMCP
         check_only: Annotated[
             bool,
             Field(
-                description=(
-                    "When true, only verify managed links and do not write the file. "
-                    "Defaults to false."
-                ),
+                description=("When true, only verify managed links and do not write the file. Defaults to false."),
             ),
         ] = False,
     ) -> dict[str, object]:
@@ -72,8 +69,7 @@ def create_server(application: MermaidLinksApplication | None = None) -> FastMCP
             str | None,
             Field(
                 description=(
-                    "Stable Mermaid block id from list_diagrams. Provide exactly one of "
-                    "block_id or block_index."
+                    "Stable Mermaid block id from list_diagrams. Provide exactly one of block_id or block_index."
                 ),
             ),
         ] = None,
