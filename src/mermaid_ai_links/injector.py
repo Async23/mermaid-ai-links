@@ -16,7 +16,7 @@ import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 from urllib.parse import urlsplit, urlunsplit
@@ -27,6 +27,10 @@ DEFAULT_CDP_URL = "http://127.0.0.1:9222"
 DEFAULT_CHROME_PATH = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
 DEFAULT_USER_DATA_DIR = Path("~/Library/Application Support/Google/Chrome-Mermaid-AI").expanduser()
 INJECTION_OVERLAY_ID = "mermaid-ai-inject-loading-overlay"
+UI_ACTION_TIMEOUT_MS = 3_000
+CODE_PANEL_OPEN_SELECTOR = '[data-testid="code-editor-btn"]'
+CODE_PANEL_COLLAPSE_SELECTOR = '[data-testid="collapse-btn"]'
+LAYOUT_OPTION_SELECTOR = "button.listbox-item"
 EDIT_URL_RE = re.compile(
     r"^/app/projects/[^/]+/diagrams/[^/]+/version/[^/]+/edit/?$",
     re.IGNORECASE,
@@ -144,12 +148,21 @@ class InjectConfig:
 
 
 @dataclass(frozen=True)
+class EditorPresentationResult:
+    auto_layout_enabled: bool = False
+    adaptive_layout_selected: bool = False
+    code_panel_collapsed: bool = False
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class InjectResult:
     reused_tab: bool
     selector_description: str
     preview_evidence: str
     page_title: str
     auto_update_enabled: bool
+    presentation: EditorPresentationResult = field(default_factory=EditorPresentationResult)
 
 
 def _without_newline(line: str) -> str:
@@ -511,6 +524,27 @@ def _page_looks_logged_out(page: Any) -> bool:
     return "sign in" in title or "log in" in title
 
 
+def _ui_action_timeout(timeout_ms: int) -> int:
+    return min(max(timeout_ms, 1), UI_ACTION_TIMEOUT_MS)
+
+
+def _dispatch_background_click(locator: Any, timeout_ms: int) -> None:
+    """Click without Playwright's foreground-oriented pointer stability checks."""
+    locator.dispatch_event("click", timeout=_ui_action_timeout(timeout_ms))
+
+
+def _open_code_panel_if_collapsed(page: Any, timeout_ms: int) -> bool:
+    """Reopen the editor when the previous successful injection left it collapsed."""
+    opener = page.locator(f"{CODE_PANEL_OPEN_SELECTOR}:visible")
+    if not opener.count():
+        return False
+    try:
+        _dispatch_background_click(opener.first, timeout_ms)
+    except Exception as exc:
+        raise BrowserError("Code 面板已收起，但无法在后台重新展开；Mermaid.ai 控件可能已变化") from exc
+    return True
+
+
 def _validate_failure_url(failure_url: str) -> str:
     parsed = urlsplit(failure_url)
     if (
@@ -619,7 +653,16 @@ def _find_editor(page: Any, config: InjectConfig) -> tuple[Any, str]:
             candidates.append((page.locator(value), f"CSS {value}"))
 
     deadline = time.monotonic() + config.timeout_ms / 1000
+    last_open_error = ""
     while time.monotonic() < deadline:
+        # The waiting page navigates to Mermaid.ai immediately after starting
+        # the worker. Its URL can become visible to CDP before React mounts the
+        # collapsed Code control, so reopening must be part of this readiness
+        # loop instead of a one-shot action before it.
+        try:
+            _open_code_panel_if_collapsed(page, config.timeout_ms)
+        except BrowserError as exc:
+            last_open_error = str(exc)
         for locator, description in candidates:
             try:
                 if locator.count() and locator.first.is_visible():
@@ -636,9 +679,11 @@ def _find_editor(page: Any, config: InjectConfig) -> tuple[Any, str]:
         title = page.title()
     except Exception:
         title = "<unavailable>"
+    open_error = f"；最近一次展开错误: {last_open_error}" if last_open_error else ""
     raise BrowserError(
         "等待 Code 编辑器超时，可能是选择器失效；"
-        f"当前标题={title!r}。按 README 的“维护选择器”检查 Editor content / Monaco textarea"
+        f"当前标题={title!r}{open_error}。"
+        "按 README 的“维护选择器”检查 Editor content / Monaco textarea"
     )
 
 
@@ -714,17 +759,143 @@ def _visible_error_text(page: Any) -> str:
     return " | ".join(values)
 
 
+def _enable_named_switch(page: Any, name: str, timeout_ms: int = UI_ACTION_TIMEOUT_MS) -> bool:
+    switch = page.get_by_role("switch", name=name, exact=True)
+    if not switch.count() or not switch.first.is_visible():
+        return False
+    if switch.first.get_attribute("aria-checked") != "true":
+        checkbox = switch.first.locator('input[type="checkbox"]')
+        if not checkbox.count():
+            return False
+        # Clicking the real checkbox fires the component's input/change path
+        # without Playwright waiting for a constantly moving background canvas.
+        checkbox.first.evaluate(
+            "element => element.click()",
+            timeout=_ui_action_timeout(timeout_ms),
+        )
+    return switch.first.get_attribute("aria-checked") == "true"
+
+
 def _ensure_auto_update(page: Any) -> bool:
     try:
-        switch = page.get_by_role("switch", name="Auto-Update", exact=True)
-        if not switch.count() or not switch.first.is_visible():
-            return False
-        checked = switch.first.get_attribute("aria-checked")
-        if checked == "false":
-            switch.first.click()
-        return switch.first.get_attribute("aria-checked") == "true"
+        return _enable_named_switch(page, "Auto-Update")
     except Exception:
         return False
+
+
+def _enable_auto_layout(page: Any, timeout_ms: int) -> bool:
+    return _enable_named_switch(page, "Auto-Layout toggle", timeout_ms)
+
+
+def _layout_option(page: Any, name: str) -> Any:
+    # Closed listboxes are intentionally absent from Playwright's accessibility
+    # tree, but Mermaid.ai keeps their React buttons mounted in the DOM.
+    exact_text = re.compile(rf"^\s*{re.escape(name)}\s*$")
+    return page.locator(LAYOUT_OPTION_SELECTOR).filter(has_text=exact_text)
+
+
+def _layout_option_is_selected(page: Any, name: str) -> bool:
+    option = _layout_option(page, name)
+    if not option.count():
+        return False
+    # Mermaid.ai renders the selected option's checkmark as a direct sibling of
+    # its label container. This lets us avoid opening an already-correct menu.
+    return option.first.locator(":scope > div > svg").count() > 0
+
+
+def _adaptive_layout_is_selected(page: Any) -> bool:
+    return _layout_option_is_selected(page, "Adaptive") and not _layout_option_is_selected(
+        page,
+        "Hierarchical",
+    )
+
+
+def _select_adaptive_layout(page: Any, timeout_ms: int) -> bool:
+    if _adaptive_layout_is_selected(page):
+        return True
+
+    timeout = _ui_action_timeout(timeout_ms)
+    adaptive = _layout_option(page, "Adaptive")
+    if not adaptive.count():
+        return False
+
+    # The layout popup remains in the DOM while closed and inert. Calling the
+    # option button directly avoids the popup animation race that otherwise
+    # leaves Auto-Layout in its default Hierarchical mode.
+    adaptive.first.evaluate("element => element.click()", timeout=timeout)
+
+    deadline = time.monotonic() + timeout / 1000
+    while time.monotonic() < deadline:
+        if _adaptive_layout_is_selected(page):
+            return True
+        page.wait_for_timeout(50)
+    return _adaptive_layout_is_selected(page)
+
+
+def _collapse_code_panel(page: Any, editor: Any, timeout_ms: int) -> bool:
+    collapse = page.locator(CODE_PANEL_COLLAPSE_SELECTOR)
+    if not collapse.count() or not collapse.first.is_visible():
+        return not editor.is_visible()
+
+    _dispatch_background_click(collapse.first, timeout_ms)
+    try:
+        editor.wait_for(state="hidden", timeout=_ui_action_timeout(timeout_ms))
+    except Exception:
+        # The authoritative result is the current visibility. Some Mermaid.ai
+        # builds remove Monaco immediately instead of completing an animation.
+        pass
+    return not editor.is_visible()
+
+
+def _ui_action_warning(label: str, error: Exception | None = None) -> str:
+    if error is None:
+        return f"未确认：{label}；Mermaid.ai 控件可能已变化"
+    detail = str(error).splitlines()[0].strip()[:240]
+    suffix = f": {detail}" if detail else ""
+    return f"{label}失败（{type(error).__name__}{suffix}）"
+
+
+def _configure_editor_presentation(
+    page: Any,
+    editor: Any,
+    timeout_ms: int,
+) -> EditorPresentationResult:
+    """Apply best-effort view preferences without invalidating a successful injection."""
+    warnings: list[str] = []
+
+    try:
+        auto_layout_enabled = _enable_auto_layout(page, timeout_ms)
+    except Exception as exc:
+        auto_layout_enabled = False
+        warnings.append(_ui_action_warning("开启 Auto-Layout", exc))
+    else:
+        if not auto_layout_enabled:
+            warnings.append(_ui_action_warning("Auto-Layout 已开启"))
+
+    try:
+        adaptive_layout_selected = _select_adaptive_layout(page, timeout_ms)
+    except Exception as exc:
+        adaptive_layout_selected = False
+        warnings.append(_ui_action_warning("选择 Adaptive 布局", exc))
+    else:
+        if not adaptive_layout_selected:
+            warnings.append(_ui_action_warning("布局模式为 Adaptive"))
+
+    try:
+        code_panel_collapsed = _collapse_code_panel(page, editor, timeout_ms)
+    except Exception as exc:
+        code_panel_collapsed = False
+        warnings.append(_ui_action_warning("关闭 Code 面板", exc))
+    else:
+        if not code_panel_collapsed:
+            warnings.append(_ui_action_warning("Code 面板已关闭"))
+
+    return EditorPresentationResult(
+        auto_layout_enabled=auto_layout_enabled,
+        adaptive_layout_selected=adaptive_layout_selected,
+        code_panel_collapsed=code_panel_collapsed,
+        warnings=tuple(warnings),
+    )
 
 
 def _wait_for_preview(page: Any, code: str, previous_preview: str, config: InjectConfig) -> str:
@@ -830,6 +1001,11 @@ def inject_with_playwright(
                             raise BrowserError("源码已注入，但无法完成加载遮罩或一次性 URL 标记清理") from exc
                     else:
                         _remove_injection_overlay(page)
+                presentation = _configure_editor_presentation(
+                    page,
+                    editor,
+                    config.timeout_ms,
+                )
                 try:
                     page_title = page.title()
                 except Exception:
@@ -843,6 +1019,7 @@ def inject_with_playwright(
                     preview_evidence=preview_evidence,
                     page_title=page_title,
                     auto_update_enabled=auto_update_enabled,
+                    presentation=presentation,
                 )
         raise BrowserError("创建后台草稿图页面后无法重新连接")
     except MermaidAIError:
@@ -931,6 +1108,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("OK: Auto-Update 已开启")
         else:
             print("warning: 未确认 Auto-Update 开关；已改用预览 DOM 验证", file=sys.stderr)
+        if result.presentation.auto_layout_enabled and result.presentation.adaptive_layout_selected:
+            print("OK: Auto-Layout 已开启并使用 Adaptive")
+        if result.presentation.code_panel_collapsed:
+            print("OK: Code 面板已关闭")
+        for warning in result.presentation.warnings:
+            print(f"warning: {warning}", file=sys.stderr)
         print(f"OK: {result.preview_evidence}")
         return 0
     except MermaidAIError as exc:

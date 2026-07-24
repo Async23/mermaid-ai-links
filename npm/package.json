@@ -1,6 +1,6 @@
 {
   "name": "mermaid-ai-links",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Open the latest Mermaid block from Markdown in a shared Mermaid.ai scratch diagram.",
   "type": "module",
   "bin": {

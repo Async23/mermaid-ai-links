@@ -19,7 +19,7 @@
   "mcpServers": {
     "mermaid-ai-links": {
       "command": "npx",
-      "args": ["-y", "mermaid-ai-links@0.2.0", "mcp"]
+      "args": ["-y", "mermaid-ai-links@0.2.1", "mcp"]
     }
   }
 }
@@ -28,10 +28,10 @@
 ## CLI
 
 ```zsh
-npx -y mermaid-ai-links@0.2.0 --version
-npx -y mermaid-ai-links@0.2.0 doctor
-npx -y mermaid-ai-links@0.2.0 sync /absolute/path/to/note.md
-npx -y mermaid-ai-links@0.2.0 start
+npx -y mermaid-ai-links@0.2.1 --version
+npx -y mermaid-ai-links@0.2.1 doctor
+npx -y mermaid-ai-links@0.2.1 sync /absolute/path/to/note.md
+npx -y mermaid-ai-links@0.2.1 start
 ```
 
 完整配置、安全边界和使用说明见

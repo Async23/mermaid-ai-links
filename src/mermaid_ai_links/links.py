@@ -704,6 +704,8 @@ class MermaidBridge:
             file=sys.stderr,
             flush=True,
         )
+        for warning in result.presentation.warnings:
+            print(f"inject warning: {warning}", file=sys.stderr, flush=True)
         return BridgeOpenResult(self._config.edit_url, diagram, result)
 
     def create_job(self, token: str, signature: str) -> JobSnapshot:

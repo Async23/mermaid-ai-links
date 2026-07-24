@@ -3,11 +3,12 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import re
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from mermaid_ai_links import injector
 
@@ -200,6 +201,125 @@ class TargetMarkerTests(unittest.TestCase):
 
 
 class InjectionStatusTests(unittest.TestCase):
+    def test_waits_for_delayed_code_opener_before_finding_editor(self) -> None:
+        page = MagicMock()
+        editor = MagicMock()
+        absent_editor = MagicMock()
+        state = {"opener_probes": 0, "editor_available": False}
+
+        editor.count.side_effect = lambda: int(state["editor_available"])
+        editor.first.is_visible.return_value = True
+        absent_editor.count.return_value = 0
+        page.get_by_role.return_value = editor
+        page.locator.return_value = absent_editor
+        config = injector.InjectConfig(
+            edit_url="https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit",
+            timeout_ms=1_000,
+        )
+
+        def delayed_open(_page: object, _timeout_ms: int) -> bool:
+            state["opener_probes"] += 1
+            if state["opener_probes"] == 2:
+                state["editor_available"] = True
+                return True
+            return False
+
+        with (
+            patch.object(
+                injector,
+                "_open_code_panel_if_collapsed",
+                side_effect=delayed_open,
+            ) as open_panel,
+            patch.object(injector.time, "monotonic", side_effect=[0, 0.1, 0.2, 2]),
+            patch.object(injector.time, "sleep"),
+            patch.object(injector, "_page_looks_logged_out", return_value=False),
+        ):
+            found, description = injector._find_editor(page, config)
+
+        self.assertIs(found, editor.first)
+        self.assertEqual('role=textbox name="Editor content"', description)
+        self.assertEqual(2, open_panel.call_count)
+
+    def test_reopens_collapsed_code_panel_before_injection(self) -> None:
+        page = MagicMock()
+        opener = MagicMock()
+        page.locator.return_value = opener
+        opener.count.return_value = 1
+        opener.first.is_visible.return_value = True
+
+        opened = injector._open_code_panel_if_collapsed(page, timeout_ms=500)
+
+        self.assertTrue(opened)
+        page.locator.assert_called_once_with('[data-testid="code-editor-btn"]:visible')
+        opener.first.dispatch_event.assert_called_once_with("click", timeout=500)
+
+    def test_enables_auto_layout_when_switch_is_off(self) -> None:
+        page = MagicMock()
+        switch = MagicMock()
+        page.get_by_role.return_value = switch
+        switch.count.return_value = 1
+        switch.first.is_visible.return_value = True
+        switch.first.get_attribute.side_effect = ["false", "true"]
+        checkbox = switch.first.locator.return_value
+        checkbox.count.return_value = 1
+
+        enabled = injector._enable_auto_layout(page, timeout_ms=500)
+
+        self.assertTrue(enabled)
+        page.get_by_role.assert_called_once_with(
+            "switch",
+            name="Auto-Layout toggle",
+            exact=True,
+        )
+        switch.first.locator.assert_called_once_with('input[type="checkbox"]')
+        checkbox.first.evaluate.assert_called_once_with(
+            "element => element.click()",
+            timeout=500,
+        )
+
+    def test_selects_adaptive_layout_without_opening_popup(self) -> None:
+        page = MagicMock()
+        options = MagicMock()
+        adaptive = MagicMock()
+        adaptive.count.return_value = 1
+        adaptive.first.locator.return_value.count.side_effect = [0, 1]
+        hierarchical = MagicMock()
+        hierarchical.count.return_value = 1
+        hierarchical.first.locator.return_value.count.return_value = 0
+
+        def by_text(*, has_text: re.Pattern[str]) -> MagicMock:
+            return adaptive if "Adaptive" in has_text.pattern else hierarchical
+
+        page.locator.return_value = options
+        options.filter.side_effect = by_text
+
+        selected = injector._select_adaptive_layout(page, timeout_ms=500)
+
+        self.assertTrue(selected)
+        adaptive.first.evaluate.assert_called_once_with(
+            "element => element.click()",
+            timeout=500,
+        )
+        page.locator.assert_called_with("button.listbox-item")
+        page.get_by_role.assert_not_called()
+
+    def test_editor_presentation_degrades_without_failing_injection(self) -> None:
+        page = MagicMock()
+        editor = MagicMock()
+        with (
+            patch.object(injector, "_enable_auto_layout", side_effect=RuntimeError("UI changed")),
+            patch.object(injector, "_select_adaptive_layout", return_value=False),
+            patch.object(injector, "_collapse_code_panel", return_value=True),
+        ):
+            result = injector._configure_editor_presentation(page, editor, timeout_ms=500)
+
+        self.assertFalse(result.auto_layout_enabled)
+        self.assertFalse(result.adaptive_layout_selected)
+        self.assertTrue(result.code_panel_collapsed)
+        self.assertEqual(2, len(result.warnings))
+        self.assertIn("Auto-Layout", result.warnings[0])
+        self.assertIn("Adaptive", result.warnings[1])
+
     def test_background_focus_emulation_is_scoped_and_detached(self) -> None:
         events: list[object] = []
 
