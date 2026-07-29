@@ -282,9 +282,9 @@ mermaid-ai-links open /absolute/path/to/note.md --block-id <BLOCK_ID>
 
 MCP Python SDK 当前使用稳定的 `1.x` 版本并限制 `<2`；等 v2 稳定后再单独评估迁移，不自动接收 beta 的破坏性变化。
 
-## 7. 直接注入 CLI 与 Obsidian 可选命令
+## 7. 直接注入 CLI
 
-标准 Markdown 链接不依赖 Obsidian 插件。原有 CLI 仍可用于诊断或脚本调用：
+除标准 Markdown 链接外，直接注入 CLI 仍可用于诊断或脚本调用：
 
 ```zsh
 inject-mermaid-ai --code $'flowchart TB\n  Hello-->World'
@@ -298,8 +298,6 @@ inject-mermaid-ai --file /absolute/note.md --line 104
 # 只验证提取，不连接 Chrome
 inject-mermaid-ai --file note.md --block 3 --dry-run
 ```
-
-`integrations/obsidian/mermaid-ai-inject` 中的 Desktop-only Obsidian 插件是可选快捷命令，不参与标准 Markdown 链接链路。
 
 ## 8. 常见失败
 
