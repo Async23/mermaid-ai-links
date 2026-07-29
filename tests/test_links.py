@@ -10,6 +10,8 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Callable
+from unittest.mock import patch
 
 from mermaid_ai_links import links
 
@@ -532,6 +534,99 @@ class HttpAdapterTests(unittest.TestCase):
             self.assertEqual(2, len(attempts))
             self.assertEqual([attempts[0]], [attempts[1]])
             self.assertEqual([], presented_failures)
+
+    def test_newer_click_supersedes_a_stale_marker_wait_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "note.md"
+            secret_path = Path(directory) / "secret"
+            origin = f"http://127.0.0.1:{free_port()}"
+            path.write_text("```mermaid\nA-->LatestClick\n```\n", encoding="utf-8")
+            links.sync_file(path, origin=origin, secret_path=secret_path)
+            parsed = first_app_link(path.read_text(encoding="utf-8"))
+            secret = links.load_or_create_secret(secret_path, create=False)
+            config = links.injector.InjectConfig(
+                edit_url="https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit"
+            )
+            first_started = threading.Event()
+            failure_presented = threading.Event()
+            markers: list[str | None] = []
+            presented_failures: list[str] = []
+            fake_result = links.injector.InjectResult(
+                reused_tab=True,
+                selector_description="fake editor",
+                preview_evidence="preview contains LatestClick",
+                page_title="fake",
+                auto_update_enabled=True,
+            )
+
+            def cancellable_default_inject(
+                _code: str,
+                _config: links.injector.InjectConfig,
+                *,
+                target_marker: str | None,
+                cancelled: Callable[[], bool] | None,
+            ) -> links.injector.InjectResult:
+                markers.append(target_marker)
+                if len(markers) == 1:
+                    first_started.set()
+                    deadline = time.monotonic() + 2
+                    while cancelled is not None and not cancelled() and time.monotonic() < deadline:
+                        time.sleep(0.005)
+                    if cancelled is not None and cancelled():
+                        raise links.injector.BrowserError("本次点击已被后续点击取代")
+                    raise AssertionError("旧任务没有及时收到取消信号")
+                return fake_result
+
+            def record_failure(
+                _config: links.injector.InjectConfig,
+                _marker: str,
+                url: str,
+            ) -> None:
+                presented_failures.append(url)
+                failure_presented.set()
+
+            bridge = links.MermaidBridge(
+                secret,
+                config,
+                present_failure=record_failure,
+                preflight=lambda _config: None,
+                origin=origin,
+                max_injection_attempts=2,
+                retry_delay_seconds=0,
+            )
+            with patch.object(
+                links.injector,
+                "inject_with_playwright",
+                side_effect=cancellable_default_inject,
+            ):
+                first = bridge.create_job(parsed.token, parsed.signature)
+                bridge.start_job(first.job_id)
+                self.assertTrue(first_started.wait(timeout=1))
+
+                second = bridge.create_job(parsed.token, parsed.signature)
+                started_at = time.monotonic()
+                bridge.start_job(second.job_id)
+
+                deadline = time.monotonic() + 2
+                first_snapshot = bridge.get_job(first.job_id)
+                second_snapshot = bridge.get_job(second.job_id)
+                while (
+                    first_snapshot.state == "running" or second_snapshot.state == "running"
+                ) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                    first_snapshot = bridge.get_job(first.job_id)
+                    second_snapshot = bridge.get_job(second.job_id)
+
+            self.assertEqual("failed", first_snapshot.state, first_snapshot)
+            self.assertIn("后续点击取代", str(first_snapshot.error))
+            superseded_html = links._failure_page(first_snapshot).body.decode("utf-8")
+            self.assertIn("已切换到更新的 Mermaid 图", superseded_html)
+            self.assertNotIn("重新尝试", superseded_html)
+            self.assertEqual("succeeded", second_snapshot.state, second_snapshot)
+            self.assertLess(time.monotonic() - started_at, 1)
+            self.assertEqual(2, len(markers))
+            self.assertTrue(failure_presented.wait(timeout=1))
+            self.assertEqual([first.failure_url], presented_failures)
 
     def test_preflight_failure_keeps_the_user_on_the_local_waiting_page(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

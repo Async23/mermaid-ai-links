@@ -25,7 +25,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -60,6 +60,7 @@ LIVE_LINK_RE = re.compile(
 )
 DEFAULT_MAX_INJECTION_ATTEMPTS = 2
 DEFAULT_RETRY_DELAY_SECONDS = 0.35
+SUPERSEDED_ERROR = "本次点击已被后续点击取代"
 
 
 class LinkError(RuntimeError):
@@ -170,6 +171,8 @@ class _BridgeJob:
     attempts: int = 0
     result: BridgeOpenResult | None = None
     error: str | None = None
+    superseded: threading.Event = field(default_factory=threading.Event, repr=False)
+    failure_presentation_pending: bool = False
 
 
 @dataclass(frozen=True)
@@ -657,13 +660,7 @@ class MermaidBridge:
         self._origin = validate_origin(origin)
         self._max_injection_attempts = max_injection_attempts
         self._retry_delay_seconds = retry_delay_seconds
-        self._inject = inject or (
-            lambda code, inject_config, marker: injector.inject_with_playwright(
-                code,
-                inject_config,
-                target_marker=marker,
-            )
-        )
+        self._inject = inject
         self._present_failure = present_failure or injector.present_failure_page
         self._preflight = preflight or injector.ensure_browser_ready
         self._inject_lock = threading.Lock()
@@ -690,12 +687,21 @@ class MermaidBridge:
         token: str,
         signature: str,
         target_marker: str | None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> BridgeOpenResult:
         started = time.monotonic()
         diagram = resolve_linked_diagram(token, signature, self._secret)
         print(f"inject start: {diagram.description}", file=sys.stderr, flush=True)
         try:
-            result = self._inject(diagram.code, self._config, target_marker)
+            if self._inject is None:
+                result = injector.inject_with_playwright(
+                    diagram.code,
+                    self._config,
+                    target_marker=target_marker,
+                    cancelled=cancelled,
+                )
+            else:
+                result = self._inject(diagram.code, self._config, target_marker)
         except injector.MermaidAIError as exc:
             raise BridgeError(str(exc)) from exc
         print(
@@ -763,6 +769,9 @@ class MermaidBridge:
                         flush=True,
                     )
                 else:
+                    for existing in self._jobs.values():
+                        if existing.job_id != job_id and existing.state == "running":
+                            existing.superseded.set()
                     job.state = "running"
                     worker = threading.Thread(
                         target=self._run_job,
@@ -781,6 +790,35 @@ class MermaidBridge:
                 raise LinkError("注入任务不存在或已过期，请重新点击 Markdown 链接")
             return self._snapshot(job)
 
+    def _present_pending_superseded_failures(self) -> None:
+        """Replace stale marker tabs while the caller still owns the injection lock."""
+        with self._jobs_lock:
+            pending = [
+                (job.job_id, f"mermaid-ai-inject={job.job_id}", job.failure_url)
+                for job in self._jobs.values()
+                if job.failure_presentation_pending
+            ]
+            for job_id, _marker, _failure_url in pending:
+                current = self._jobs.get(job_id)
+                if current is not None:
+                    current.failure_presentation_pending = False
+
+        for job_id, marker, failure_url in pending:
+            try:
+                self._present_failure(self._config, marker, failure_url)
+            except Exception as exc:
+                with self._jobs_lock:
+                    current = self._jobs.get(job_id)
+                    if current is not None:
+                        current.failure_presentation_pending = True
+                print(
+                    f"inject superseded page FAILED: job_id={job_id}; error={str(exc) or type(exc).__name__}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                print(f"inject superseded page shown: job_id={job_id}", file=sys.stderr, flush=True)
+
     def _run_job(self, job_id: str) -> None:
         with self._jobs_lock:
             job = self._jobs.get(job_id)
@@ -790,18 +828,29 @@ class MermaidBridge:
             signature = job.signature
             marker = f"mermaid-ai-inject={job_id}"
             failure_url = job.failure_url
+            superseded = job.superseded
 
         result: BridgeOpenResult | None = None
         last_error = "未知注入错误"
+        was_superseded = False
         with self._inject_lock:
             for attempt in range(1, self._max_injection_attempts + 1):
+                if superseded.is_set():
+                    was_superseded = True
+                    last_error = SUPERSEDED_ERROR
+                    print(
+                        f"inject superseded before attempt: job_id={job_id}; error={last_error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    break
                 with self._jobs_lock:
                     current = self._jobs.get(job_id)
                     if current is None:
                         return
                     current.attempts = attempt
                 try:
-                    result = self._open_once(token, signature, marker)
+                    result = self._open_once(token, signature, marker, superseded.is_set)
                 except LinkError as exc:
                     last_error = str(exc)
                     print(
@@ -813,6 +862,15 @@ class MermaidBridge:
                     break
                 except BridgeError as exc:
                     last_error = str(exc)
+                    if superseded.is_set():
+                        was_superseded = True
+                        last_error = SUPERSEDED_ERROR
+                        print(
+                            f"inject superseded: job_id={job_id}; attempt={attempt}; error={last_error}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        break
                     will_retry = attempt < self._max_injection_attempts
                     print(
                         f"inject attempt FAILED: job_id={job_id}; "
@@ -827,6 +885,20 @@ class MermaidBridge:
                     break
                 else:
                     break
+
+            if result is None and was_superseded:
+                with self._jobs_lock:
+                    current = self._jobs.get(job_id)
+                    if current is None:
+                        return
+                    current.state = "failed"
+                    current.error = last_error
+                    current.failure_presentation_pending = True
+            else:
+                self._present_pending_superseded_failures()
+
+        if was_superseded:
+            return
 
         if result is None:
             with self._jobs_lock:
@@ -957,6 +1029,11 @@ def _html_page(title: str, message: str) -> HtmlPage:
 
 def _failure_page(snapshot: JobSnapshot) -> HtmlPage:
     error = snapshot.error or "未知错误"
+    if error == SUPERSEDED_ERROR:
+        return _render_page(
+            "已切换到更新的 Mermaid 图",
+            "<h1>已切换到更新的 Mermaid 图</h1><p>这次点击已被后续点击取代，请查看最新打开的 Mermaid.ai 标签。</p>",
+        )
     retry_url = snapshot.retry_url or "#"
     return _render_page(
         "Mermaid.ai 注入失败",

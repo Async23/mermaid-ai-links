@@ -18,7 +18,7 @@ import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
 
@@ -487,12 +487,15 @@ def _wait_for_matching_page(
     edit_url: str,
     timeout_ms: int,
     target_marker: str | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> Any:
     deadline = time.monotonic() + timeout_ms / 1000
     while time.monotonic() < deadline:
         matching = _find_matching_page(browser, edit_url, target_marker)
         if matching is not None:
             return matching
+        if cancelled is not None and cancelled():
+            raise BrowserError("本次点击已被后续点击取代")
         login_page = next(
             (
                 page
@@ -642,7 +645,11 @@ def _emulate_page_focus(page: Any) -> Iterator[None]:
             pass
 
 
-def _find_editor(page: Any, config: InjectConfig) -> tuple[Any, str]:
+def _find_editor(
+    page: Any,
+    config: InjectConfig,
+    cancelled: Callable[[], bool] | None = None,
+) -> tuple[Any, str]:
     candidates: list[tuple[Any, str]] = []
     if config.editor_selector:
         candidates.append((page.locator(config.editor_selector), f"config CSS {config.editor_selector!r}"))
@@ -655,6 +662,8 @@ def _find_editor(page: Any, config: InjectConfig) -> tuple[Any, str]:
     deadline = time.monotonic() + config.timeout_ms / 1000
     last_open_error = ""
     while time.monotonic() < deadline:
+        if cancelled is not None and cancelled():
+            raise BrowserError("本次点击已被后续点击取代")
         # The waiting page navigates to Mermaid.ai immediately after starting
         # the worker. Its URL can become visible to CDP before React mounts the
         # collapsed Code control, so reopening must be part of this readiness
@@ -898,13 +907,21 @@ def _configure_editor_presentation(
     )
 
 
-def _wait_for_preview(page: Any, code: str, previous_preview: str, config: InjectConfig) -> str:
+def _wait_for_preview(
+    page: Any,
+    code: str,
+    previous_preview: str,
+    config: InjectConfig,
+    cancelled: Callable[[], bool] | None = None,
+) -> str:
     labels = candidate_preview_labels(code)
     labels_not_in_previous_preview = [label for label in labels if label not in previous_preview]
     labels_to_match = labels_not_in_previous_preview or labels
     deadline = time.monotonic() + config.timeout_ms / 1000
     last_error = ""
     while time.monotonic() < deadline:
+        if cancelled is not None and cancelled():
+            raise BrowserError("本次点击已被后续点击取代")
         preview = _preview_text(page)
         if preview:
             matched = next((label for label in labels_to_match if label in preview), None)
@@ -929,6 +946,7 @@ def inject_with_playwright(
     config: InjectConfig,
     *,
     target_marker: str | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> InjectResult:
     try:
         from playwright.sync_api import Error as PlaywrightError
@@ -955,6 +973,7 @@ def inject_with_playwright(
                         config.edit_url,
                         config.timeout_ms,
                         target_marker,
+                        cancelled,
                     )
                 elif page is None and not target_created:
                     _create_background_target(browser, config.edit_url)
@@ -969,16 +988,21 @@ def inject_with_playwright(
                 page.set_default_timeout(config.timeout_ms)
                 page.set_default_navigation_timeout(config.timeout_ms)
                 try:
-                    page.wait_for_load_state("domcontentloaded", timeout=config.timeout_ms)
+                    page.wait_for_load_state(
+                        "domcontentloaded",
+                        timeout=min(config.timeout_ms, UI_ACTION_TIMEOUT_MS),
+                    )
                 except PlaywrightError:
                     # SPA editors can remain busy after DOMContentLoaded; the editor wait
                     # below is the authoritative readiness check.
                     pass
 
                 _show_injection_overlay(page)
-                editor, selector_description = _find_editor(page, config)
+                editor, selector_description = _find_editor(page, config, cancelled)
                 previous_preview = _preview_text(page)
                 auto_update_enabled = _ensure_auto_update(page)
+                if cancelled is not None and cancelled():
+                    raise BrowserError("本次点击已被后续点击取代")
 
                 # Background Chrome targets can ignore key events while still
                 # accepting Input.insertText. Focus emulation makes Meta+A reach
@@ -989,7 +1013,13 @@ def inject_with_playwright(
                         raise BrowserError("Code 编辑器无法获得输入焦点；页面可能被 modal/登录层遮挡")
                     page.keyboard.press("Meta+A")
                     page.keyboard.insert_text(code)
-                    preview_evidence = _wait_for_preview(page, code, previous_preview, config)
+                    preview_evidence = _wait_for_preview(
+                        page,
+                        code,
+                        previous_preview,
+                        config,
+                        cancelled,
+                    )
                     if target_marker is not None:
                         try:
                             _remove_injection_overlay(page)

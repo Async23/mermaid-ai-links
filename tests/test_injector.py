@@ -193,6 +193,23 @@ class TargetMarkerTests(unittest.TestCase):
             injector._find_matching_page(browser, edit_url, "mermaid-ai-inject=job123"),
         )
 
+    def test_marker_wait_stops_when_a_newer_click_supersedes_it(self) -> None:
+        class FakeContext:
+            pages: list[object] = []
+
+        class FakeBrowser:
+            contexts = [FakeContext()]
+
+        edit_url = "https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit"
+        with self.assertRaisesRegex(injector.BrowserError, "后续点击取代"):
+            injector._wait_for_matching_page(
+                FakeBrowser(),
+                edit_url,
+                10_000,
+                "mermaid-ai-inject=old-job",
+                lambda: True,
+            )
+
     def test_failure_page_must_stay_on_loopback(self) -> None:
         valid = "http://127.0.0.1:38473/v1/jobs/abc/failure"
         self.assertEqual(valid, injector._validate_failure_url(valid))
