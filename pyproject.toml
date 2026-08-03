@@ -20,7 +20,7 @@ classifiers = [
 ]
 dependencies = [
   "mcp>=1.28,<2",
-  "playwright>=1.61,<2",
+  "playwright>=1.62.0,<2",
   "PyYAML>=6,<7",
 ]
 
