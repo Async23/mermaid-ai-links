@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import injector, links
+from . import automation, injector, links
 
 
 class ApplicationError(RuntimeError):
@@ -102,11 +102,11 @@ class MermaidLinksApplication:
 
     def diagnose(self) -> DiagnosticReport:
         checks: list[DiagnosticCheck] = []
-        config: injector.InjectConfig | None = None
+        browser: automation.MermaidAIAdapter | None = None
 
         try:
-            config = injector.load_inject_config(self.settings.config_path)
-        except injector.MermaidAIError as exc:
+            browser = injector.ChromeMermaidAIAdapter.load(self.settings.config_path)
+        except automation.AutomationError as exc:
             checks.append(DiagnosticCheck("config", False, str(exc)))
         else:
             checks.append(DiagnosticCheck("config", True, str(self.settings.config_path)))
@@ -130,12 +130,14 @@ class MermaidLinksApplication:
                 )
             )
 
-        if config is None:
+        if browser is None:
             checks.append(DiagnosticCheck("browser", False, "配置无效，未检查 Chrome/CDP"))
-        elif injector.browser_is_ready(config):
-            checks.append(DiagnosticCheck("browser", True, config.cdp_url))
         else:
-            checks.append(DiagnosticCheck("browser", False, f"Chrome/CDP 不可用：{config.cdp_url}"))
+            readiness = browser.readiness()
+            if readiness.ready:
+                checks.append(DiagnosticCheck("browser", True, readiness.detail))
+            else:
+                checks.append(DiagnosticCheck("browser", False, f"Chrome/CDP 不可用：{readiness.detail}"))
 
         return DiagnosticReport(tuple(checks))
 

@@ -9,7 +9,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from mermaid_ai_links import cdp, injector
+from mermaid_ai_links import automation, cdp, injector
 
 
 class MermaidBlockTests(unittest.TestCase):
@@ -186,7 +186,7 @@ class TargetMarkerTests(unittest.TestCase):
                 return None
 
         edit_url = "https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit"
-        with self.assertRaisesRegex(injector.BrowserError, "后续点击取代"):
+        with self.assertRaisesRegex(injector.InjectionSuperseded, "后续任务取代"):
             injector._wait_for_matching_target(
                 FakeBrowser(),
                 edit_url,
@@ -195,11 +195,11 @@ class TargetMarkerTests(unittest.TestCase):
                 lambda: True,
             )
 
-    def test_failure_page_must_stay_on_loopback(self) -> None:
+    def test_outcome_page_must_stay_on_loopback(self) -> None:
         valid = "http://127.0.0.1:38473/v1/jobs/abc/failure"
-        self.assertEqual(valid, injector._validate_failure_url(valid))
+        self.assertEqual(valid, injector._validate_outcome_url(valid))
         with self.assertRaisesRegex(injector.ConfigError, "本机"):
-            injector._validate_failure_url("https://example.com/v1/jobs/abc/failure")
+            injector._validate_outcome_url("https://example.com/v1/jobs/abc/failure")
 
 
 class InjectionStatusTests(unittest.TestCase):
@@ -368,6 +368,48 @@ class InjectionStatusTests(unittest.TestCase):
             self.assertRaisesRegex(injector.BrowserError, "Chrome/CDP 不可用"),
         ):
             injector.ensure_browser_ready(config)
+
+
+class ChromeMermaidAIAdapterTests(unittest.TestCase):
+    def test_prepared_target_hides_marker_and_returns_typed_supersession(self) -> None:
+        config = injector.InjectConfig(
+            edit_url="https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit"
+        )
+        adapter = injector.ChromeMermaidAIAdapter(config)
+
+        with patch.object(injector, "ensure_browser_ready"):
+            target = adapter.prepare_target("job123")
+
+        self.assertEqual(f"{config.edit_url}#mermaid-ai-inject=job123", target.navigation_url)
+        with patch.object(
+            injector,
+            "inject_with_cdp",
+            side_effect=injector.InjectionSuperseded("superseded"),
+        ) as inject:
+            outcome = target.inject("A-->B", superseded=lambda: True)
+
+        self.assertIsInstance(outcome, automation.AttemptSuperseded)
+        self.assertEqual("mermaid-ai-inject=job123", inject.call_args.kwargs["target_marker"])
+        self.assertTrue(inject.call_args.kwargs["superseded"]())
+
+    def test_direct_injection_returns_stable_receipt(self) -> None:
+        config = injector.InjectConfig(
+            edit_url="https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit"
+        )
+        result = injector.InjectResult(
+            reused_tab=True,
+            selector_description="fake editor",
+            preview_evidence="preview contains B",
+            page_title="fake",
+            auto_update_enabled=True,
+        )
+        with patch.object(injector, "inject_with_cdp", return_value=result):
+            receipt = injector.ChromeMermaidAIAdapter(config).inject("A-->B")
+
+        self.assertEqual(config.edit_url, receipt.edit_url)
+        self.assertEqual("preview contains B", receipt.evidence)
+        self.assertIn("已通过 fake editor 注入 5 chars", receipt.observations)
+        self.assertEqual((), receipt.warnings)
 
 
 class CliTests(unittest.TestCase):

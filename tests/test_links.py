@@ -10,10 +10,9 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Callable
-from unittest.mock import patch
+from mermaid_ai_links import automation, links
 
-from mermaid_ai_links import links
+from fakes import ScriptedMermaidAIAdapter, ScriptedPreparedTarget, receipt
 
 
 def free_port() -> int:
@@ -262,13 +261,10 @@ class HttpAdapterTests(unittest.TestCase):
             path.write_text(detached, encoding="utf-8")
             secret = links.load_or_create_secret(secret_path, create=False)
             settings = links.ServerSettings(host="127.0.0.1", port=port)
-            config = links.injector.InjectConfig(
-                edit_url="https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit"
-            )
+            browser = ScriptedMermaidAIAdapter()
             bridge = links.MermaidBridge(
                 secret,
-                config,
-                preflight=lambda _config: None,
+                browser,
                 origin=origin,
             )
             server = links.ThreadingHTTPServer(
@@ -311,34 +307,14 @@ class HttpAdapterTests(unittest.TestCase):
             links.sync_file(path, origin=origin, secret_path=secret_path)
             parsed = first_app_link(path.read_text(encoding="utf-8"))
             secret = links.load_or_create_secret(secret_path, create=False)
-            captured: list[str] = []
-            config = links.injector.InjectConfig(
-                edit_url="https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit"
+            browser = ScriptedMermaidAIAdapter(
+                attempt=lambda _code, _target, _superseded: receipt("preview contains LatestFromDisk")
             )
-            fake_result = links.injector.InjectResult(
-                reused_tab=True,
-                selector_description="fake editor",
-                preview_evidence="preview contains LatestFromDisk",
-                page_title="fake",
-                auto_update_enabled=True,
-            )
-
-            def fake_inject(
-                code: str,
-                _config: links.injector.InjectConfig,
-                target_marker: str | None,
-            ) -> links.injector.InjectResult:
-                captured.append(code)
-                self.assertIsNotNone(target_marker)
-                self.assertTrue(target_marker.startswith("mermaid-ai-inject="))
-                return fake_result
 
             settings = links.ServerSettings(host="127.0.0.1", port=port)
             bridge = links.MermaidBridge(
                 secret,
-                config,
-                inject=fake_inject,
-                preflight=lambda _config: None,
+                browser,
                 origin=origin,
             )
             server = links.ThreadingHTTPServer(
@@ -355,7 +331,7 @@ class HttpAdapterTests(unittest.TestCase):
                 self.assertIn("data.state==='failed'", waiting_html)
                 self.assertEqual(1, len(policies))
                 self.assertIn("script-src 'nonce-", policies[0])
-                self.assertEqual([], captured, "initial navigation must finish before CDP injection starts")
+                self.assertEqual([], browser.injected, "initial navigation must finish before CDP injection starts")
 
                 start_request = urllib.request.Request(
                     f"{origin}/v1/jobs/{job_id}/start",
@@ -376,14 +352,15 @@ class HttpAdapterTests(unittest.TestCase):
                         break
                     time.sleep(0.01)
                 self.assertEqual("succeeded", job.get("state"), job)
-                self.assertEqual(config.edit_url, job.get("edit_url"))
-                self.assertEqual(["A-->LatestFromDisk\n"], captured)
+                self.assertEqual(browser.edit_url, job.get("edit_url"))
+                self.assertEqual(["A-->LatestFromDisk\n"], [item[0] for item in browser.injected])
+                self.assertEqual(job_id, browser.prepared[0].job_id)
 
                 request = urllib.request.Request(parsed.url, method="HEAD")
                 with self.assertRaises(urllib.error.HTTPError) as head_error:
                     urllib.request.urlopen(request, timeout=3)
                 self.assertEqual(405, head_error.exception.code)
-                self.assertEqual(1, len(captured), "HEAD/link preview must never inject")
+                self.assertEqual(1, len(browser.injected), "HEAD/link preview must never inject")
             finally:
                 server.shutdown()
                 server.server_close()
@@ -399,34 +376,28 @@ class HttpAdapterTests(unittest.TestCase):
             links.sync_file(path, origin=origin, secret_path=secret_path)
             parsed = first_app_link(path.read_text(encoding="utf-8"))
             secret = links.load_or_create_secret(secret_path, create=False)
-            config = links.injector.InjectConfig(
-                edit_url="https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit"
-            )
-            attempts: list[tuple[str, str | None]] = []
-            presented_failures: list[tuple[str, str]] = []
+            presented_outcomes: list[tuple[str, str]] = []
 
             def failing_inject(
                 code: str,
-                _config: links.injector.InjectConfig,
-                target_marker: str | None,
-            ) -> links.injector.InjectResult:
-                attempts.append((code, target_marker))
-                raise links.injector.BrowserError("Monaco 临时失去焦点")
+                _target: ScriptedPreparedTarget | None,
+                _superseded: automation.SupersessionProbe,
+            ) -> automation.InjectionAttempt:
+                self.assertEqual("A-->ExpectedDiagram\n", code)
+                raise automation.AutomationError("Monaco 临时失去焦点")
 
-            def present_failure(
-                _config: links.injector.InjectConfig,
-                target_marker: str,
-                failure_url: str,
+            def present_outcome(
+                target: ScriptedPreparedTarget,
+                outcome_url: str,
             ) -> None:
-                presented_failures.append((target_marker, failure_url))
+                presented_outcomes.append((target.marker, outcome_url))
+
+            browser = ScriptedMermaidAIAdapter(attempt=failing_inject, on_navigate=present_outcome)
 
             settings = links.ServerSettings(host="127.0.0.1", port=port)
             bridge = links.MermaidBridge(
                 secret,
-                config,
-                inject=failing_inject,
-                present_failure=present_failure,
-                preflight=lambda _config: None,
+                browser,
                 origin=origin,
                 max_injection_attempts=2,
                 retry_delay_seconds=0,
@@ -459,20 +430,23 @@ class HttpAdapterTests(unittest.TestCase):
                 self.assertEqual("failed", job.get("state"), job)
                 self.assertEqual(2, job.get("attempts"), job)
                 self.assertIn("Monaco 临时失去焦点", str(job.get("error")))
-                self.assertEqual(2, len(attempts))
+                self.assertEqual(2, len(browser.injected))
                 expected_marker = f"mermaid-ai-inject={job_id}"
-                self.assertEqual([expected_marker, expected_marker], [item[1] for item in attempts])
-                self.assertEqual(1, len(presented_failures))
-                marker, failure_url = presented_failures[0]
+                self.assertEqual(
+                    [expected_marker, expected_marker],
+                    [item[1].marker for item in browser.injected if item[1] is not None],
+                )
+                self.assertEqual(1, len(presented_outcomes))
+                marker, outcome_url = presented_outcomes[0]
                 self.assertEqual(expected_marker, marker)
-                self.assertEqual(f"{origin}/v1/jobs/{job_id}/failure", failure_url)
+                self.assertEqual(f"{origin}/v1/jobs/{job_id}/failure", outcome_url)
 
-                with urllib.request.urlopen(failure_url, timeout=3) as response:
+                with urllib.request.urlopen(outcome_url, timeout=3) as response:
                     failure_html = response.read().decode("utf-8")
                 self.assertIn("Mermaid.ai 注入失败", failure_html)
                 self.assertIn("Monaco 临时失去焦点", failure_html)
                 self.assertIn("重新尝试", failure_html)
-                self.assertNotIn(config.edit_url, failure_html)
+                self.assertNotIn(browser.edit_url, failure_html)
             finally:
                 server.shutdown()
                 server.server_close()
@@ -487,35 +461,23 @@ class HttpAdapterTests(unittest.TestCase):
             links.sync_file(path, origin=origin, secret_path=secret_path)
             parsed = first_app_link(path.read_text(encoding="utf-8"))
             secret = links.load_or_create_secret(secret_path, create=False)
-            config = links.injector.InjectConfig(
-                edit_url="https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit"
-            )
-            attempts: list[str | None] = []
-            presented_failures: list[str] = []
-            fake_result = links.injector.InjectResult(
-                reused_tab=True,
-                selector_description="fake editor",
-                preview_evidence="preview contains ExpectedDiagram",
-                page_title="fake",
-                auto_update_enabled=True,
-            )
+            attempts: list[ScriptedPreparedTarget | None] = []
 
             def flaky_inject(
                 _code: str,
-                _config: links.injector.InjectConfig,
-                target_marker: str | None,
-            ) -> links.injector.InjectResult:
-                attempts.append(target_marker)
+                target: ScriptedPreparedTarget | None,
+                _superseded: automation.SupersessionProbe,
+            ) -> automation.InjectionAttempt:
+                attempts.append(target)
                 if len(attempts) == 1:
-                    raise links.injector.BrowserError("CDP transient disconnect")
-                return fake_result
+                    raise automation.AutomationError("CDP transient disconnect")
+                return receipt()
+
+            browser = ScriptedMermaidAIAdapter(attempt=flaky_inject)
 
             bridge = links.MermaidBridge(
                 secret,
-                config,
-                inject=flaky_inject,
-                present_failure=lambda _config, _marker, url: presented_failures.append(url),
-                preflight=lambda _config: None,
+                browser,
                 origin=origin,
                 max_injection_attempts=2,
                 retry_delay_seconds=0,
@@ -532,8 +494,53 @@ class HttpAdapterTests(unittest.TestCase):
             self.assertEqual("succeeded", snapshot.state, snapshot)
             self.assertEqual(2, snapshot.attempts)
             self.assertEqual(2, len(attempts))
-            self.assertEqual([attempts[0]], [attempts[1]])
-            self.assertEqual([], presented_failures)
+            self.assertIs(attempts[0], attempts[1])
+            self.assertEqual([], browser.destinations)
+
+    def test_outcome_navigation_failure_does_not_rewrite_the_job_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "note.md"
+            secret_path = Path(directory) / "secret"
+            origin = f"http://127.0.0.1:{free_port()}"
+            path.write_text("```mermaid\nA-->B\n```\n", encoding="utf-8")
+            links.sync_file(path, origin=origin, secret_path=secret_path)
+            parsed = first_app_link(path.read_text(encoding="utf-8"))
+            secret = links.load_or_create_secret(secret_path, create=False)
+            navigation_attempted = threading.Event()
+
+            def fail_injection(
+                _code: str,
+                _target: ScriptedPreparedTarget | None,
+                _superseded: automation.SupersessionProbe,
+            ) -> automation.InjectionAttempt:
+                raise automation.AutomationError("preview verification failed")
+
+            def fail_navigation(_target: ScriptedPreparedTarget, _destination: str) -> None:
+                navigation_attempted.set()
+                raise automation.AutomationError("target disappeared")
+
+            browser = ScriptedMermaidAIAdapter(attempt=fail_injection, on_navigate=fail_navigation)
+            bridge = links.MermaidBridge(
+                secret,
+                browser,
+                origin=origin,
+                max_injection_attempts=1,
+                retry_delay_seconds=0,
+            )
+            created = bridge.create_job(parsed.token, parsed.signature)
+            bridge.start_job(created.job_id)
+
+            deadline = time.monotonic() + 2
+            snapshot = bridge.get_job(created.job_id)
+            while snapshot.state == "running" and time.monotonic() < deadline:
+                time.sleep(0.01)
+                snapshot = bridge.get_job(created.job_id)
+
+            self.assertEqual("failed", snapshot.state)
+            self.assertEqual("preview verification failed", snapshot.error)
+            self.assertEqual(1, snapshot.attempts)
+            self.assertTrue(navigation_attempted.wait(timeout=1))
+            self.assertEqual(1, len(browser.destinations))
 
     def test_newer_click_supersedes_a_stale_marker_wait_without_blocking(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -544,89 +551,74 @@ class HttpAdapterTests(unittest.TestCase):
             links.sync_file(path, origin=origin, secret_path=secret_path)
             parsed = first_app_link(path.read_text(encoding="utf-8"))
             secret = links.load_or_create_secret(secret_path, create=False)
-            config = links.injector.InjectConfig(
-                edit_url="https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit"
-            )
             first_started = threading.Event()
-            failure_presented = threading.Event()
-            markers: list[str | None] = []
-            presented_failures: list[str] = []
-            fake_result = links.injector.InjectResult(
-                reused_tab=True,
-                selector_description="fake editor",
-                preview_evidence="preview contains LatestClick",
-                page_title="fake",
-                auto_update_enabled=True,
-            )
+            outcome_presented = threading.Event()
+            targets: list[ScriptedPreparedTarget | None] = []
+            presented_outcomes: list[str] = []
 
             def cancellable_default_inject(
                 _code: str,
-                _config: links.injector.InjectConfig,
-                *,
-                target_marker: str | None,
-                cancelled: Callable[[], bool] | None,
-            ) -> links.injector.InjectResult:
-                markers.append(target_marker)
-                if len(markers) == 1:
+                target: ScriptedPreparedTarget | None,
+                superseded: automation.SupersessionProbe,
+            ) -> automation.InjectionAttempt:
+                targets.append(target)
+                if len(targets) == 1:
                     first_started.set()
                     deadline = time.monotonic() + 2
-                    while cancelled is not None and not cancelled() and time.monotonic() < deadline:
+                    while not superseded() and time.monotonic() < deadline:
                         time.sleep(0.005)
-                    if cancelled is not None and cancelled():
-                        raise links.injector.BrowserError("本次点击已被后续点击取代")
-                    raise AssertionError("旧任务没有及时收到取消信号")
-                return fake_result
+                    if superseded():
+                        return automation.AttemptSuperseded()
+                    raise AssertionError("旧任务没有及时收到任务取代信号")
+                return receipt("preview contains LatestClick")
 
-            def record_failure(
-                _config: links.injector.InjectConfig,
-                _marker: str,
+            def record_outcome(
+                _target: ScriptedPreparedTarget,
                 url: str,
             ) -> None:
-                presented_failures.append(url)
-                failure_presented.set()
+                presented_outcomes.append(url)
+                outcome_presented.set()
+
+            browser = ScriptedMermaidAIAdapter(
+                attempt=cancellable_default_inject,
+                on_navigate=record_outcome,
+            )
 
             bridge = links.MermaidBridge(
                 secret,
-                config,
-                present_failure=record_failure,
-                preflight=lambda _config: None,
+                browser,
                 origin=origin,
                 max_injection_attempts=2,
                 retry_delay_seconds=0,
             )
-            with patch.object(
-                links.injector,
-                "inject_with_cdp",
-                side_effect=cancellable_default_inject,
-            ):
-                first = bridge.create_job(parsed.token, parsed.signature)
-                bridge.start_job(first.job_id)
-                self.assertTrue(first_started.wait(timeout=1))
+            first = bridge.create_job(parsed.token, parsed.signature)
+            bridge.start_job(first.job_id)
+            self.assertTrue(first_started.wait(timeout=1))
 
-                second = bridge.create_job(parsed.token, parsed.signature)
-                started_at = time.monotonic()
-                bridge.start_job(second.job_id)
+            second = bridge.create_job(parsed.token, parsed.signature)
+            started_at = time.monotonic()
+            bridge.start_job(second.job_id)
 
-                deadline = time.monotonic() + 2
+            deadline = time.monotonic() + 2
+            first_snapshot = bridge.get_job(first.job_id)
+            second_snapshot = bridge.get_job(second.job_id)
+            while (
+                first_snapshot.state == "running" or second_snapshot.state == "running"
+            ) and time.monotonic() < deadline:
+                time.sleep(0.01)
                 first_snapshot = bridge.get_job(first.job_id)
                 second_snapshot = bridge.get_job(second.job_id)
-                while (
-                    first_snapshot.state == "running" or second_snapshot.state == "running"
-                ) and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                    first_snapshot = bridge.get_job(first.job_id)
-                    second_snapshot = bridge.get_job(second.job_id)
 
-            self.assertEqual("failed", first_snapshot.state, first_snapshot)
-            self.assertIn("后续点击取代", str(first_snapshot.error))
-            superseded_html = links._failure_page(first_snapshot).body.decode("utf-8")
+            self.assertEqual("superseded", first_snapshot.state, first_snapshot)
+            self.assertIsNone(first_snapshot.error)
+            superseded_html = links._outcome_page(first_snapshot).body.decode("utf-8")
             self.assertIn("已切换到更新的 Mermaid 图", superseded_html)
             self.assertNotIn("重新尝试", superseded_html)
             self.assertEqual("succeeded", second_snapshot.state, second_snapshot)
             self.assertLess(time.monotonic() - started_at, 1)
-            self.assertEqual(2, len(markers))
-            self.assertTrue(failure_presented.wait(timeout=1))
-            self.assertEqual([first.failure_url], presented_failures)
+            self.assertEqual(2, len(targets))
+            self.assertTrue(outcome_presented.wait(timeout=1))
+            self.assertEqual([first.outcome_url], presented_outcomes)
 
     def test_preflight_failure_keeps_the_user_on_the_local_waiting_page(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -637,29 +629,22 @@ class HttpAdapterTests(unittest.TestCase):
             links.sync_file(path, origin=origin, secret_path=secret_path)
             parsed = first_app_link(path.read_text(encoding="utf-8"))
             secret = links.load_or_create_secret(secret_path, create=False)
-            config = links.injector.InjectConfig(
-                edit_url="https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit"
-            )
-            injected: list[str] = []
-            presented_failures: list[str] = []
 
-            def fail_preflight(_config: links.injector.InjectConfig) -> None:
-                raise links.injector.BrowserError("Chrome/CDP 不可用")
+            def fail_preflight(_job_id: str) -> None:
+                raise automation.AutomationError("Chrome/CDP 不可用")
 
             def should_not_inject(
-                code: str,
-                _config: links.injector.InjectConfig,
-                _marker: str | None,
-            ) -> links.injector.InjectResult:
-                injected.append(code)
+                _code: str,
+                _target: ScriptedPreparedTarget | None,
+                _superseded: automation.SupersessionProbe,
+            ) -> automation.InjectionAttempt:
                 raise AssertionError("preflight failure must prevent injection")
+
+            browser = ScriptedMermaidAIAdapter(attempt=should_not_inject, prepare=fail_preflight)
 
             bridge = links.MermaidBridge(
                 secret,
-                config,
-                inject=should_not_inject,
-                present_failure=lambda _config, _marker, url: presented_failures.append(url),
-                preflight=fail_preflight,
+                browser,
                 origin=origin,
             )
             created = bridge.create_job(parsed.token, parsed.signature)
@@ -668,8 +653,8 @@ class HttpAdapterTests(unittest.TestCase):
             self.assertEqual("failed", started.state)
             self.assertEqual(0, started.attempts)
             self.assertIn("Chrome/CDP 不可用", str(started.error))
-            self.assertEqual([], injected)
-            self.assertEqual([], presented_failures)
+            self.assertEqual([], browser.injected)
+            self.assertEqual([], browser.destinations)
 
 
 class ManualLifecycleTests(unittest.TestCase):

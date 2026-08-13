@@ -13,7 +13,9 @@ from typing import Any
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from mermaid_ai_links import injector, links
+from mermaid_ai_links import links
+
+from fakes import ScriptedMermaidAIAdapter, receipt
 
 
 def free_port() -> int:
@@ -50,28 +52,13 @@ class McpProtocolTests(unittest.TestCase):
                 state_dir=root / "state",
             )
             secret = links.load_or_create_secret(settings.secret_path)
-            fake_config = injector.load_inject_config(config_path)
-            injected: list[tuple[str, str | None]] = []
-            fake_result = injector.InjectResult(
-                reused_tab=True,
-                selector_description="fake editor",
-                preview_evidence="preview contains McpExpectedDiagram",
-                page_title="fake",
-                auto_update_enabled=True,
+            browser = ScriptedMermaidAIAdapter(
+                attempt=lambda _code, _target, _superseded: receipt("preview contains McpExpectedDiagram")
             )
-
-            def fake_inject(
-                code: str,
-                _config: injector.InjectConfig,
-                marker: str | None,
-            ) -> injector.InjectResult:
-                injected.append((code, marker))
-                return fake_result
 
             bridge = links.MermaidBridge(
                 secret,
-                fake_config,
-                inject=fake_inject,
+                browser,
                 origin=settings.origin,
             )
             server = links.ThreadingHTTPServer(
@@ -154,7 +141,7 @@ class McpProtocolTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=3)
 
-            self.assertEqual([("A-->McpExpectedDiagram\n", None)], injected)
+            self.assertEqual([("A-->McpExpectedDiagram\n", None)], browser.injected)
 
 
 if __name__ == "__main__":

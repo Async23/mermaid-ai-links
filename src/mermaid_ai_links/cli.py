@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Sequence
 from urllib.parse import urlsplit
 
-from . import __version__, injector, links
+from . import __version__, automation, injector, links
 from .application import ApplicationError, MermaidLinksApplication
 
 
@@ -172,7 +172,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             return run_stdio(MermaidLinksApplication(settings))
         parser.error(f"unknown command: {args.command}")
-    except (ApplicationError, links.LinkError, links.BridgeError, injector.MermaidAIError) as exc:
+    except (
+        ApplicationError,
+        automation.AutomationError,
+        links.LinkError,
+        links.BridgeError,
+        injector.MermaidAIError,
+    ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     return 2

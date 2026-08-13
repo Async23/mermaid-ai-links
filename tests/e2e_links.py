@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from mermaid_ai_links import cdp, injector, links
+from mermaid_ai_links import automation, cdp, injector, links
 
 
 DEFAULT_NOTE = Path(__file__).resolve().parents[1] / "docs" / "C4.md"
@@ -230,12 +230,38 @@ def verify_failed_injection_replaces_stale_page(config: injector.InjectConfig) -
         parsed = _first_link(note.read_text(encoding="utf-8"))
         secret = links.load_or_create_secret(secret_path, create=False)
 
-        def fail_injection(
-            _code: str,
-            _config: injector.InjectConfig,
-            _target_marker: str | None,
-        ) -> injector.InjectResult:
-            raise injector.BrowserError(failure_message)
+        production_browser = injector.ChromeMermaidAIAdapter(config)
+
+        class FailingTarget:
+            def __init__(self, target: automation.PreparedTarget) -> None:
+                self._target = target
+
+            @property
+            def navigation_url(self) -> str:
+                return self._target.navigation_url
+
+            def inject(
+                self,
+                _code: str,
+                *,
+                superseded: automation.SupersessionProbe,
+            ) -> automation.InjectionAttempt:
+                if superseded():
+                    return automation.AttemptSuperseded()
+                raise automation.AutomationError(failure_message)
+
+            def navigate_to(self, destination: str) -> None:
+                self._target.navigate_to(destination)
+
+        class FailingBrowser:
+            def readiness(self) -> automation.AutomationReadiness:
+                return production_browser.readiness()
+
+            def inject(self, _code: str) -> automation.InjectionReceipt:
+                raise automation.AutomationError(failure_message)
+
+            def prepare_target(self, job_id: str) -> automation.PreparedTarget:
+                return FailingTarget(production_browser.prepare_target(job_id))
 
         settings = links.ServerSettings(
             host="127.0.0.1",
@@ -246,8 +272,7 @@ def verify_failed_injection_replaces_stale_page(config: injector.InjectConfig) -
         )
         bridge = links.MermaidBridge(
             secret,
-            config,
-            inject=fail_injection,
+            FailingBrowser(),
             origin=origin,
             max_injection_attempts=2,
             retry_delay_seconds=0,

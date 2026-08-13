@@ -11,6 +11,8 @@ from unittest.mock import patch
 
 from mermaid_ai_links import application, injector, links
 
+from fakes import ScriptedMermaidAIAdapter, receipt
+
 
 def free_port() -> int:
     with socket.socket() as candidate:
@@ -87,25 +89,10 @@ class ApplicationInterfaceTests(unittest.TestCase):
             app = application.MermaidLinksApplication(settings)
             app.sync_document(note)
             secret = links.load_or_create_secret(settings.secret_path, create=False)
-            config = injector.InjectConfig(edit_url="https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit")
-            injected: list[tuple[str, str | None]] = []
-            fake_result = injector.InjectResult(
-                reused_tab=True,
-                selector_description="fake editor",
-                preview_evidence="preview contains ExpectedDiagram",
-                page_title="fake",
-                auto_update_enabled=True,
+            browser = ScriptedMermaidAIAdapter(
+                attempt=lambda _code, _target, _superseded: receipt("preview contains ExpectedDiagram")
             )
-
-            def fake_inject(
-                code: str,
-                _config: injector.InjectConfig,
-                marker: str | None,
-            ) -> injector.InjectResult:
-                injected.append((code, marker))
-                return fake_result
-
-            bridge = links.MermaidBridge(secret, config, inject=fake_inject, origin=settings.origin)
+            bridge = links.MermaidBridge(secret, browser, origin=settings.origin)
             server = links.ThreadingHTTPServer(
                 (settings.host, settings.port),
                 links.make_http_handler(bridge, settings),
@@ -122,7 +109,7 @@ class ApplicationInterfaceTests(unittest.TestCase):
                 with self.assertRaises(urllib.error.HTTPError) as raised:
                     urllib.request.urlopen(unauthorized, timeout=3)
                 self.assertEqual(403, raised.exception.code)
-                self.assertEqual([], injected)
+                self.assertEqual([], browser.injected)
 
                 opened = app.open_diagram(note, block_index=1)
             finally:
@@ -132,7 +119,7 @@ class ApplicationInterfaceTests(unittest.TestCase):
 
             self.assertEqual(1, opened.block_index)
             self.assertEqual("preview contains ExpectedDiagram", opened.evidence)
-            self.assertEqual([("A-->ExpectedDiagram\n", None)], injected)
+            self.assertEqual([("A-->ExpectedDiagram\n", None)], browser.injected)
 
 
 if __name__ == "__main__":

@@ -58,6 +58,7 @@ Markdown link
 - 当前只支持手动 `start/status/stop`，**不会创建、加载或修改 macOS LaunchAgent**。
 - HTTP 点击只更新带本次 marker 的标签；CLI/MCP 会复用或创建后台草稿标签。两条链路都只用 CDP focus emulation 驱动 Monaco，不会把 Chrome 或标签切到前台。
 - CDP 适配器只打开目标 Mermaid.ai 标签自身的 WebSocket，不会 attach、初始化或等待日常 Chrome 中的其他页面；连接不会再被其他页面的加载状态拖住。
+- Bridge 只决定串行、重试、任务取代与最终结果；Chrome / Mermaid.ai Adapter 独占完整浏览器配置，并封装预检、一次性 marker、精确目标标签、Monaco 写入、预览验证与结果页导航。
 - 注入期间会遮住共用草稿的旧内容；成功才显示新图。瞬时故障自动重试一次，最终失败会显示错误与“重新尝试”，不会让旧图冒充本次结果。
 - 每次失败及重试都会写入持久日志，包含 `job_id`、尝试次数和具体错误。
 - 系统外链必须交给 `cdp_url` 所指向的同一个 Chrome 实例；仓库提供真实 E2E 脚本用于本机验收。

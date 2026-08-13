@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
-from . import cdp
+from . import automation, cdp
 
 
 DEFAULT_CONFIG_PATH = Path("~/.config/mermaid-ai-inject/config.yaml").expanduser()
@@ -116,6 +116,10 @@ class ConfigError(MermaidAIError):
 
 class BrowserError(MermaidAIError):
     """Chrome, login, selector, or preview failure."""
+
+
+class InjectionSuperseded(MermaidAIError):
+    """Internal control flow: a newer injection job replaced this attempt."""
 
 
 @dataclass(frozen=True)
@@ -475,15 +479,15 @@ def _wait_for_matching_target(
     edit_url: str,
     timeout_ms: int,
     target_marker: str | None = None,
-    cancelled: Callable[[], bool] | None = None,
+    superseded: Callable[[], bool] | None = None,
 ) -> cdp.TargetInfo:
     deadline = time.monotonic() + timeout_ms / 1000
     while time.monotonic() < deadline:
         matching = _find_matching_target(browser, edit_url, target_marker)
         if matching is not None:
             return matching
-        if cancelled is not None and cancelled():
-            raise BrowserError("本次点击已被后续点击取代")
+        if superseded is not None and superseded():
+            raise InjectionSuperseded("本次注入任务已被后续任务取代")
         login_target = browser.find_target(
             lambda target: (
                 (urlsplit(target.url).hostname or "").lower() in {"mermaid.ai", "www.mermaid.ai"}
@@ -503,8 +507,8 @@ def _ui_action_timeout(timeout_ms: int) -> int:
     return min(max(timeout_ms, 1), UI_ACTION_TIMEOUT_MS)
 
 
-def _validate_failure_url(failure_url: str) -> str:
-    parsed = urlsplit(failure_url)
+def _validate_outcome_url(outcome_url: str) -> str:
+    parsed = urlsplit(outcome_url)
     if (
         parsed.scheme != "http"
         or parsed.hostname not in {"127.0.0.1", "localhost"}
@@ -514,15 +518,15 @@ def _validate_failure_url(failure_url: str) -> str:
         or parsed.query
         or parsed.fragment
     ):
-        raise ConfigError("失败页必须是显式端口的本机 http://127.0.0.1 或 localhost URL")
-    return failure_url
+        raise ConfigError("结果页必须是显式端口的本机 http://127.0.0.1 或 localhost URL")
+    return outcome_url
 
 
-def present_failure_page(config: InjectConfig, target_marker: str, failure_url: str) -> None:
-    """Replace the exact failed Mermaid.ai tab so stale scratch content cannot masquerade as success."""
-    destination = _validate_failure_url(failure_url)
+def present_outcome_page(config: InjectConfig, target_marker: str, outcome_url: str) -> None:
+    """Replace the exact Mermaid.ai tab with the job's local terminal outcome."""
+    destination = _validate_outcome_url(outcome_url)
     if not _cdp_is_ready(config.cdp_url):
-        raise BrowserError("Chrome/CDP 已断开，无法把失败的 Mermaid.ai 页替换为本机错误页")
+        raise BrowserError("Chrome/CDP 已断开，无法把 Mermaid.ai 页替换为本机结果页")
     timeout_ms = min(config.timeout_ms, 10_000)
     try:
         browser = cdp.ChromeCdp(config.cdp_url, timeout_ms)
@@ -534,9 +538,9 @@ def present_failure_page(config: InjectConfig, target_marker: str, failure_url: 
     except MermaidAIError:
         raise
     except cdp.CdpError as exc:
-        raise BrowserError(f"无法把失败标签导航到错误页: {exc}") from exc
+        raise BrowserError(f"无法把目标标签导航到结果页: {exc}") from exc
     except Exception as exc:
-        raise BrowserError(f"无法显示失败页: {type(exc).__name__}: {exc}") from exc
+        raise BrowserError(f"无法显示结果页: {type(exc).__name__}: {exc}") from exc
 
 
 def _show_injection_overlay(session: cdp.CdpConnection) -> None:
@@ -571,7 +575,7 @@ def _remove_injection_overlay(session: cdp.CdpConnection) -> None:
 def _find_editor(
     session: cdp.CdpConnection,
     config: InjectConfig,
-    cancelled: Callable[[], bool] | None = None,
+    superseded: Callable[[], bool] | None = None,
 ) -> tuple[str, str]:
     candidates: list[tuple[str, str]] = []
     if config.editor_selector:
@@ -585,8 +589,8 @@ def _find_editor(
     deadline = time.monotonic() + config.timeout_ms / 1000
     last_state: dict[str, Any] = {}
     while time.monotonic() < deadline:
-        if cancelled is not None and cancelled():
-            raise BrowserError("本次点击已被后续点击取代")
+        if superseded is not None and superseded():
+            raise InjectionSuperseded("本次注入任务已被后续任务取代")
         state = session.evaluate(
             f"""(() => {{
                 const visible = element => !!(element &&
@@ -870,7 +874,7 @@ def _wait_for_preview(
     code: str,
     previous_preview: str,
     config: InjectConfig,
-    cancelled: Callable[[], bool] | None = None,
+    superseded: Callable[[], bool] | None = None,
 ) -> str:
     labels = candidate_preview_labels(code)
     labels_not_in_previous_preview = [label for label in labels if label not in previous_preview]
@@ -879,8 +883,8 @@ def _wait_for_preview(
     last_error = ""
     blocking_error_seen_at: float | None = None
     while time.monotonic() < deadline:
-        if cancelled is not None and cancelled():
-            raise BrowserError("本次点击已被后续点击取代")
+        if superseded is not None and superseded():
+            raise InjectionSuperseded("本次注入任务已被后续任务取代")
         preview = _preview_text(session)
         if preview:
             matched = next((label for label in labels_to_match if label in preview), None)
@@ -974,7 +978,7 @@ def inject_with_cdp(
     config: InjectConfig,
     *,
     target_marker: str | None = None,
-    cancelled: Callable[[], bool] | None = None,
+    superseded: Callable[[], bool] | None = None,
 ) -> InjectResult:
     ensure_browser_ready(config)
 
@@ -988,7 +992,7 @@ def inject_with_cdp(
                 config.edit_url,
                 config.timeout_ms,
                 target_marker,
-                cancelled,
+                superseded,
             )
         elif target is None:
             target_id = browser.create_background_target(config.edit_url)
@@ -998,21 +1002,21 @@ def inject_with_cdp(
                 target = browser.target_by_id(target_id)
                 if target is not None:
                     break
-                if cancelled is not None and cancelled():
-                    raise BrowserError("本次点击已被后续点击取代")
+                if superseded is not None and superseded():
+                    raise InjectionSuperseded("本次注入任务已被后续任务取代")
                 time.sleep(0.1)
             if target is None:
                 raise BrowserError("已创建后台 target，但无法连接目标标签")
 
         with browser.connect(target) as session:
             _show_injection_overlay(session)
-            editor_selector, selector_description = _find_editor(session, config, cancelled)
+            editor_selector, selector_description = _find_editor(session, config, superseded)
             _show_injection_overlay(session)
             _wait_for_editor_ready(session, editor_selector, config.timeout_ms)
             previous_preview = _preview_text(session)
             auto_update_enabled = _ensure_auto_update(session)
-            if cancelled is not None and cancelled():
-                raise BrowserError("本次点击已被后续点击取代")
+            if superseded is not None and superseded():
+                raise InjectionSuperseded("本次注入任务已被后续任务取代")
 
             _write_editor(session, editor_selector, code)
             preview_evidence = _wait_for_preview(
@@ -1020,7 +1024,7 @@ def inject_with_cdp(
                 code,
                 previous_preview,
                 config,
-                cancelled,
+                superseded,
             )
             try:
                 _remove_injection_overlay(session)
@@ -1051,6 +1055,129 @@ def inject_with_cdp(
         raise BrowserError(f"目标标签 CDP 操作失败: {exc}") from exc
     except Exception as exc:
         raise BrowserError(f"浏览器注入失败: {type(exc).__name__}: {exc}") from exc
+
+
+def _injection_receipt(code: str, config: InjectConfig, result: InjectResult) -> automation.InjectionReceipt:
+    target_status = "复用现有后台标签" if result.reused_tab else "新建后台标签"
+    observations = [
+        f"{target_status}；页面={result.page_title!r}",
+        f"已通过 {result.selector_description} 注入 {len(code)} chars",
+    ]
+    warnings = list(result.presentation.warnings)
+    if result.auto_update_enabled:
+        observations.append("Auto-Update 已开启")
+    else:
+        warnings.append("未确认 Auto-Update 开关；已改用预览 DOM 验证")
+    if result.presentation.auto_layout_enabled and result.presentation.adaptive_layout_selected:
+        observations.append("Auto-Layout 已开启并使用 Adaptive")
+    if result.presentation.code_panel_collapsed:
+        observations.append("Code 面板已关闭")
+    return automation.InjectionReceipt(
+        edit_url=config.edit_url,
+        evidence=result.preview_evidence,
+        observations=tuple(observations),
+        warnings=tuple(warnings),
+    )
+
+
+@dataclass(frozen=True)
+class _ChromePreparedTarget:
+    _config: InjectConfig
+    _marker: str
+    navigation_url: str
+
+    def inject(
+        self,
+        code: str,
+        *,
+        superseded: automation.SupersessionProbe,
+    ) -> automation.InjectionAttempt:
+        try:
+            result = inject_with_cdp(
+                code,
+                self._config,
+                target_marker=self._marker,
+                superseded=superseded,
+            )
+        except InjectionSuperseded:
+            return automation.AttemptSuperseded()
+        except MermaidAIError as exc:
+            raise automation.AutomationError(str(exc)) from exc
+        return _injection_receipt(code, self._config, result)
+
+    def navigate_to(self, destination: str) -> None:
+        try:
+            present_outcome_page(self._config, self._marker, destination)
+        except MermaidAIError as exc:
+            raise automation.AutomationError(str(exc)) from exc
+
+
+class ChromeMermaidAIAdapter:
+    """Production adapter that owns all Chrome / Mermaid.ai configuration and behavior."""
+
+    def __init__(self, config: InjectConfig) -> None:
+        self._config = config
+
+    @classmethod
+    def load(
+        cls,
+        config_path: Path = DEFAULT_CONFIG_PATH,
+        *,
+        edit_url_override: str | None = None,
+        cdp_url_override: str | None = None,
+        timeout_ms_override: int | None = None,
+        launch_if_needed_override: bool | None = None,
+        headless_override: bool | None = None,
+        editor_selector_override: str | None = None,
+    ) -> ChromeMermaidAIAdapter:
+        try:
+            config = load_inject_config(
+                config_path,
+                edit_url_override=edit_url_override,
+                cdp_url_override=cdp_url_override,
+                timeout_ms_override=timeout_ms_override,
+                launch_if_needed_override=launch_if_needed_override,
+                headless_override=headless_override,
+                editor_selector_override=editor_selector_override,
+            )
+        except MermaidAIError as exc:
+            raise automation.AutomationError(str(exc)) from exc
+        return cls(config)
+
+    def readiness(self) -> automation.AutomationReadiness:
+        return automation.AutomationReadiness(
+            ready=browser_is_ready(self._config),
+            detail=self._config.cdp_url,
+        )
+
+    def inject(self, code: str) -> automation.InjectionReceipt:
+        try:
+            result = inject_with_cdp(code, self._config)
+        except InjectionSuperseded as exc:  # pragma: no cover - direct injection has no probe
+            raise automation.AutomationError("直接注入意外观察到任务取代") from exc
+        except MermaidAIError as exc:
+            raise automation.AutomationError(str(exc)) from exc
+        return _injection_receipt(code, self._config, result)
+
+    def prepare_target(self, job_id: str) -> automation.PreparedTarget:
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", job_id):
+            raise automation.AutomationError("注入任务 ID 无效")
+        try:
+            ensure_browser_ready(self._config)
+        except MermaidAIError as exc:
+            raise automation.AutomationError(str(exc)) from exc
+        marker = f"mermaid-ai-inject={job_id}"
+        parsed_edit_url = urlsplit(self._config.edit_url)
+        navigation_url = urlunsplit(
+            (
+                parsed_edit_url.scheme,
+                parsed_edit_url.netloc,
+                parsed_edit_url.path,
+                parsed_edit_url.query,
+                marker,
+            )
+        )
+        return _ChromePreparedTarget(self._config, marker, navigation_url)
 
 
 # Backwards-compatible internal name for callers pinned to the 0.2.x module.
@@ -1125,24 +1252,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print()
             return 0
 
-        config = load_config(args)
-        result = inject_with_cdp(selection.code, config)
-        target_status = "复用现有后台标签" if result.reused_tab else "新建后台标签"
-        print(f"OK: {target_status}；页面={result.page_title!r}")
-        print(f"OK: 已通过 {result.selector_description} 注入 {len(selection.code)} chars")
-        if result.auto_update_enabled:
-            print("OK: Auto-Update 已开启")
-        else:
-            print("warning: 未确认 Auto-Update 开关；已改用预览 DOM 验证", file=sys.stderr)
-        if result.presentation.auto_layout_enabled and result.presentation.adaptive_layout_selected:
-            print("OK: Auto-Layout 已开启并使用 Adaptive")
-        if result.presentation.code_panel_collapsed:
-            print("OK: Code 面板已关闭")
-        for warning in result.presentation.warnings:
+        adapter = ChromeMermaidAIAdapter.load(
+            args.config,
+            edit_url_override=args.url,
+            cdp_url_override=args.cdp_url,
+            timeout_ms_override=args.timeout_ms,
+            launch_if_needed_override=args.launch_if_needed,
+            headless_override=args.headless,
+            editor_selector_override=args.editor_selector,
+        )
+        receipt = adapter.inject(selection.code)
+        for observation in receipt.observations:
+            print(f"OK: {observation}")
+        for warning in receipt.warnings:
             print(f"warning: {warning}", file=sys.stderr)
-        print(f"OK: {result.preview_evidence}")
+        print(f"OK: {receipt.evidence}")
         return 0
-    except MermaidAIError as exc:
+    except (MermaidAIError, automation.AutomationError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
