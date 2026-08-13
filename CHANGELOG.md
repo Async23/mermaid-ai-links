@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.2
+
+- 新增 Chrome / Mermaid.ai Adapter 深模块边界，集中封装浏览器配置、一次性 marker、精确目标标签、Monaco 写入和预览验证。
+- 将任务取代建模为独立的 `superseded` 状态，修复 Adapter 返回成功结果与新任务到达之间的竞态。
+- 延后一次性 marker 清理并保留精确 CDP target ID，确保最终结果页始终导航本次任务对应的标签。
+- 保留 v1 `failure_url` JSON 字段和 `/failure` 路径，同时提供语义更准确的 `outcome_url`。
+
 ## 0.2.1
 
 - 打开图后自动启用 Auto-Layout、选择 Adaptive，并收起 Code 面板；下次注入会在后台自动重新展开。

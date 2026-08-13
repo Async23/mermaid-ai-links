@@ -40,7 +40,7 @@ class PublicRepositoryTests(unittest.TestCase):
     def test_python_and_npm_versions_match(self) -> None:
         project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         npm_package = json.loads((ROOT / "npm" / "package.json").read_text(encoding="utf-8"))
-        self.assertEqual("0.2.1", __version__)
+        self.assertEqual("0.2.2", __version__)
         self.assertEqual(__version__, project["project"]["version"])
         self.assertEqual(__version__, npm_package["version"])
 
