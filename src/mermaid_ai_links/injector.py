@@ -1,13 +1,14 @@
 """Inject Mermaid source into a fixed mermaid.ai diagram through Chrome CDP.
 
-The default path is deliberately background-safe: connect to an already-running,
-dedicated Chrome instance on port 9222 and never activate a tab. See
-the project README.md for the one-time browser and diagram setup.
+The default path is deliberately background-safe: connect to an already-running
+Chrome instance on port 9222, attach only to the selected target, and never
+activate a tab. See the project README.md for the one-time setup.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -15,11 +16,12 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlsplit, urlunsplit
+
+from . import cdp
 
 
 DEFAULT_CONFIG_PATH = Path("~/.config/mermaid-ai-inject/config.yaml").expanduser()
@@ -432,6 +434,10 @@ def _launch_dedicated_chrome(config: InjectConfig) -> None:
 def ensure_browser_ready(config: InjectConfig) -> None:
     """Fail before the user leaves the local waiting page when CDP is unavailable."""
     if _cdp_is_ready(config.cdp_url):
+        try:
+            cdp.ChromeCdp(config.cdp_url, config.timeout_ms).probe()
+        except cdp.CdpError as exc:
+            raise BrowserError(f"Chrome CDP HTTP 可用，但协议握手失败: {exc}") from exc
         return
     if config.launch_if_needed:
         _launch_dedicated_chrome(config)
@@ -440,112 +446,61 @@ def ensure_browser_ready(config: InjectConfig) -> None:
 
 
 def browser_is_ready(config: InjectConfig) -> bool:
-    """Return CDP readiness without launching or activating a browser."""
-    return _cdp_is_ready(config.cdp_url)
+    """Verify a real CDP round trip without attaching to the browser's pages."""
+    if not _cdp_is_ready(config.cdp_url):
+        return False
+    try:
+        cdp.ChromeCdp(config.cdp_url, config.timeout_ms).probe()
+    except cdp.CdpError:
+        return False
+    return True
 
 
-def _all_pages(browser: Any) -> list[Any]:
-    return [page for context in browser.contexts for page in context.pages]
-
-
-def _find_matching_page(browser: Any, edit_url: str, target_marker: str | None = None) -> Any | None:
-    target = canonical_edit_url(edit_url)
-    return next(
-        (
-            page
-            for page in _all_pages(browser)
-            if canonical_edit_url(page.url) == target
-            and (target_marker is None or urlsplit(page.url).fragment == target_marker)
-        ),
-        None,
+def _target_matches(target: cdp.TargetInfo, edit_url: str, target_marker: str | None = None) -> bool:
+    return canonical_edit_url(target.url) == canonical_edit_url(edit_url) and (
+        target_marker is None or urlsplit(target.url).fragment == target_marker
     )
 
 
-def _create_background_target(browser: Any, edit_url: str) -> None:
-    """Create a tab without activating Chrome.
-
-    Chrome does not always publish a target created by one CDP client back to
-    that same client's Playwright page list. The caller therefore reconnects
-    after this function returns; the fresh connection sees the target reliably.
-    """
-    session = browser.new_browser_cdp_session()
-    try:
-        session.send("Target.createTarget", {"url": edit_url, "background": True})
-    except Exception as exc:
-        raise BrowserError(
-            "无法用 CDP 创建后台标签页；请手动在专用 Chrome 打开 edit_url 后重试（不会自动创建前台页）"
-        ) from exc
-    finally:
-        try:
-            session.detach()
-        except Exception:
-            pass
+def _find_matching_target(
+    browser: cdp.ChromeCdp,
+    edit_url: str,
+    target_marker: str | None = None,
+) -> cdp.TargetInfo | None:
+    return browser.find_target(lambda target: _target_matches(target, edit_url, target_marker))
 
 
-def _wait_for_matching_page(
-    browser: Any,
+def _wait_for_matching_target(
+    browser: cdp.ChromeCdp,
     edit_url: str,
     timeout_ms: int,
     target_marker: str | None = None,
     cancelled: Callable[[], bool] | None = None,
-) -> Any:
+) -> cdp.TargetInfo:
     deadline = time.monotonic() + timeout_ms / 1000
     while time.monotonic() < deadline:
-        matching = _find_matching_page(browser, edit_url, target_marker)
+        matching = _find_matching_target(browser, edit_url, target_marker)
         if matching is not None:
             return matching
         if cancelled is not None and cancelled():
             raise BrowserError("本次点击已被后续点击取代")
-        login_page = next(
-            (
-                page
-                for page in _all_pages(browser)
-                if (urlsplit(page.url).hostname or "").lower() in {"mermaid.ai", "www.mermaid.ai"}
-                and re.search(r"/(?:login|sign-in|auth)(?:/|$)", urlsplit(page.url).path)
-            ),
-            None,
+        login_target = browser.find_target(
+            lambda target: (
+                (urlsplit(target.url).hostname or "").lower() in {"mermaid.ai", "www.mermaid.ai"}
+                and re.search(r"/(?:login|sign-in|auth)(?:/|$)", urlsplit(target.url).path) is not None
+                and (target_marker is None or urlsplit(target.url).fragment == target_marker)
+            )
         )
-        if login_page is not None:
-            return login_page
+        if login_target is not None:
+            return login_target
         time.sleep(0.1)
     if target_marker is not None:
         raise BrowserError(f"浏览器未在 {timeout_ms}ms 内打开本次点击对应的 Mermaid.ai 标签；marker={target_marker}")
-    raise BrowserError(
-        "已创建后台 target，但重新连接后仍未发现草稿图页面；"
-        "请检查 Chrome/CDP 版本兼容性，或手动在专用 Chrome 打开 edit_url 后重试"
-    )
-
-
-def _page_looks_logged_out(page: Any) -> bool:
-    path = urlsplit(page.url).path.lower()
-    if any(part in path for part in ("/login", "/sign-in", "/auth")):
-        return True
-    try:
-        title = page.title().lower()
-    except Exception:
-        title = ""
-    return "sign in" in title or "log in" in title
+    raise BrowserError("已创建后台 target，但仍未发现草稿图页面；请检查 Chrome/CDP，或手动打开 edit_url 后重试")
 
 
 def _ui_action_timeout(timeout_ms: int) -> int:
     return min(max(timeout_ms, 1), UI_ACTION_TIMEOUT_MS)
-
-
-def _dispatch_background_click(locator: Any, timeout_ms: int) -> None:
-    """Click without Playwright's foreground-oriented pointer stability checks."""
-    locator.dispatch_event("click", timeout=_ui_action_timeout(timeout_ms))
-
-
-def _open_code_panel_if_collapsed(page: Any, timeout_ms: int) -> bool:
-    """Reopen the editor when the previous successful injection left it collapsed."""
-    opener = page.locator(f"{CODE_PANEL_OPEN_SELECTOR}:visible")
-    if not opener.count():
-        return False
-    try:
-        _dispatch_background_click(opener.first, timeout_ms)
-    except Exception as exc:
-        raise BrowserError("Code 面板已收起，但无法在后台重新展开；Mermaid.ai 控件可能已变化") from exc
-    return True
 
 
 def _validate_failure_url(failure_url: str) -> str:
@@ -568,44 +523,30 @@ def present_failure_page(config: InjectConfig, target_marker: str, failure_url: 
     destination = _validate_failure_url(failure_url)
     if not _cdp_is_ready(config.cdp_url):
         raise BrowserError("Chrome/CDP 已断开，无法把失败的 Mermaid.ai 页替换为本机错误页")
-    try:
-        from playwright.sync_api import Error as PlaywrightError
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:  # pragma: no cover - the uv wrapper supplies it
-        raise BrowserError("缺少 Playwright；无法显示 Mermaid.ai 注入错误页") from exc
-
     timeout_ms = min(config.timeout_ms, 10_000)
     try:
-        with sync_playwright() as playwright:
-            browser = playwright.chromium.connect_over_cdp(
-                config.cdp_url,
-                timeout=timeout_ms,
-                is_local=True,
-                no_defaults=True,
-            )
-            page = _find_matching_page(browser, config.edit_url, target_marker)
-            if page is None:
-                page = _wait_for_matching_page(
-                    browser,
-                    config.edit_url,
-                    timeout_ms,
-                    target_marker,
-                )
-            page.goto(destination, wait_until="domcontentloaded", timeout=timeout_ms)
+        browser = cdp.ChromeCdp(config.cdp_url, timeout_ms)
+        target = _find_matching_target(browser, config.edit_url, target_marker)
+        if target is None:
+            target = _wait_for_matching_target(browser, config.edit_url, timeout_ms, target_marker)
+        with browser.connect(target) as session:
+            session.call("Page.navigate", {"url": destination})
     except MermaidAIError:
         raise
-    except PlaywrightError as exc:
-        message = str(exc).splitlines()[0]
-        raise BrowserError(f"无法把失败标签导航到错误页: {message}") from exc
+    except cdp.CdpError as exc:
+        raise BrowserError(f"无法把失败标签导航到错误页: {exc}") from exc
     except Exception as exc:
         raise BrowserError(f"无法显示失败页: {type(exc).__name__}: {exc}") from exc
 
 
-def _show_injection_overlay(page: Any) -> None:
-    page.evaluate(
-        """overlayId => {
+def _show_injection_overlay(session: cdp.CdpConnection) -> None:
+    overlay_id = json.dumps(INJECTION_OVERLAY_ID)
+    session.evaluate(
+        """(() => {
+            const overlayId = __OVERLAY_ID__;
             let overlay = document.getElementById(overlayId);
             if (!overlay) {
+                if (!document.documentElement) return false;
                 overlay = document.createElement('div');
                 overlay.id = overlayId;
                 overlay.setAttribute('role', 'status');
@@ -618,82 +559,105 @@ def _show_injection_overlay(page: Any) -> None:
                 document.documentElement.appendChild(overlay);
             }
             overlay.textContent = '正在载入这条 Markdown 对应的 Mermaid 图…';
-        }""",
-        INJECTION_OVERLAY_ID,
+            return true;
+        })()""".replace("__OVERLAY_ID__", overlay_id)
     )
 
 
-def _remove_injection_overlay(page: Any) -> None:
-    page.evaluate("overlayId => document.getElementById(overlayId)?.remove()", INJECTION_OVERLAY_ID)
-
-
-@contextmanager
-def _emulate_page_focus(page: Any) -> Iterator[None]:
-    """Deliver CDP keyboard events to a background tab without activating it."""
-    session = page.context.new_cdp_session(page)
-    try:
-        session.send("Emulation.setFocusEmulationEnabled", {"enabled": True})
-        yield
-    finally:
-        try:
-            session.send("Emulation.setFocusEmulationEnabled", {"enabled": False})
-        except Exception:
-            pass
-        try:
-            session.detach()
-        except Exception:
-            pass
+def _remove_injection_overlay(session: cdp.CdpConnection) -> None:
+    session.evaluate(f"document.getElementById({json.dumps(INJECTION_OVERLAY_ID)})?.remove()")
 
 
 def _find_editor(
-    page: Any,
+    session: cdp.CdpConnection,
     config: InjectConfig,
     cancelled: Callable[[], bool] | None = None,
-) -> tuple[Any, str]:
-    candidates: list[tuple[Any, str]] = []
+) -> tuple[str, str]:
+    candidates: list[tuple[str, str]] = []
     if config.editor_selector:
-        candidates.append((page.locator(config.editor_selector), f"config CSS {config.editor_selector!r}"))
+        candidates.append((config.editor_selector, f"config CSS {config.editor_selector!r}"))
     for locator_type, value in EDITOR_LOCATORS:
         if locator_type == "role":
-            candidates.append((page.get_by_role("textbox", name=value, exact=True), f'role=textbox name="{value}"'))
+            candidates.append((f'textarea[aria-label="{value}"]', f'role=textbox name="{value}"'))
         else:
-            candidates.append((page.locator(value), f"CSS {value}"))
+            candidates.append((value, f"CSS {value}"))
 
     deadline = time.monotonic() + config.timeout_ms / 1000
-    last_open_error = ""
+    last_state: dict[str, Any] = {}
     while time.monotonic() < deadline:
         if cancelled is not None and cancelled():
             raise BrowserError("本次点击已被后续点击取代")
-        # The waiting page navigates to Mermaid.ai immediately after starting
-        # the worker. Its URL can become visible to CDP before React mounts the
-        # collapsed Code control, so reopening must be part of this readiness
-        # loop instead of a one-shot action before it.
-        try:
-            _open_code_panel_if_collapsed(page, config.timeout_ms)
-        except BrowserError as exc:
-            last_open_error = str(exc)
-        for locator, description in candidates:
-            try:
-                if locator.count() and locator.first.is_visible():
-                    return locator.first, description
-            except Exception:
-                continue
-        if _page_looks_logged_out(page):
-            raise BrowserError("mermaid.ai 未登录或登录已过期；请在这个专用 Chrome profile 登录后重试")
+        state = session.evaluate(
+            f"""(() => {{
+                const visible = element => !!(element &&
+                    (element.offsetWidth || element.offsetHeight || element.getClientRects().length));
+                const opener = [...document.querySelectorAll({json.dumps(CODE_PANEL_OPEN_SELECTOR)})]
+                    .find(visible);
+                if (opener) opener.click();
+                const candidates = {json.dumps([selector for selector, _description in candidates])};
+                const selector = candidates.find(candidate => visible(document.querySelector(candidate))) || null;
+                const path = location.pathname.toLowerCase();
+                const title = document.title || '';
+                return {{
+                    selector,
+                    title,
+                    loggedOut: ['/login', '/sign-in', '/auth'].some(part => path.includes(part)) ||
+                        /sign in|log in/i.test(title)
+                }};
+            }})()"""
+        )
+        last_state = state if isinstance(state, dict) else {}
+        selector = last_state.get("selector")
+        if isinstance(selector, str):
+            description = next(description for candidate, description in candidates if candidate == selector)
+            return selector, description
+        if last_state.get("loggedOut"):
+            raise BrowserError("mermaid.ai 未登录或登录已过期；请在当前 Chrome 中登录后重试")
         time.sleep(0.2)
 
-    if _page_looks_logged_out(page):
+    if last_state.get("loggedOut"):
         raise BrowserError("mermaid.ai 未登录或无权访问配置的草稿图；请登录并确认 edit_url 权限")
-    try:
-        title = page.title()
-    except Exception:
-        title = "<unavailable>"
-    open_error = f"；最近一次展开错误: {last_open_error}" if last_open_error else ""
+    title = last_state.get("title", "<unavailable>")
     raise BrowserError(
         "等待 Code 编辑器超时，可能是选择器失效；"
-        f"当前标题={title!r}{open_error}。"
+        f"当前标题={title!r}。"
         "按 README 的“维护选择器”检查 Editor content / Monaco textarea"
     )
+
+
+def _wait_for_editor_ready(session: cdp.CdpConnection, editor_selector: str, timeout_ms: int) -> None:
+    """Wait for a newly loaded Monaco model to stop hydrating before replacing it."""
+    deadline = time.monotonic() + _ui_action_timeout(timeout_ms) / 1000
+    stable_since: float | None = None
+    previous_signature: tuple[Any, ...] | None = None
+    while time.monotonic() < deadline:
+        state = session.evaluate(
+            f"""(() => {{
+                const editor = document.querySelector({json.dumps(editor_selector)});
+                const view = editor?.closest('.monaco-editor')?.querySelector('.view-lines');
+                return {{
+                    ready: document.readyState === 'complete',
+                    enabled: !!editor && !editor.disabled && editor.getAttribute('aria-busy') !== 'true',
+                    lines: view?.querySelectorAll('.view-line').length || 0,
+                    sample: (view?.textContent || '').slice(0, 1000)
+                }};
+            }})()"""
+        )
+        if not isinstance(state, dict):
+            stable_since = None
+            previous_signature = None
+        else:
+            signature = (state.get("ready"), state.get("enabled"), state.get("lines"), state.get("sample"))
+            now = time.monotonic()
+            if state.get("ready") and state.get("enabled") and signature == previous_signature:
+                stable_since = stable_since or now
+                if now - stable_since >= 0.3:
+                    return
+            else:
+                stable_since = None
+            previous_signature = signature
+        time.sleep(0.05)
+    raise BrowserError("Code 编辑器已经出现，但模型在短时等待内仍未稳定；将重试本次注入")
 
 
 def _normalize_label(value: str) -> str:
@@ -729,131 +693,125 @@ def candidate_preview_labels(code: str) -> list[str]:
     return result[:16]
 
 
-def _preview_text(page: Any) -> str:
-    values: list[str] = []
-    for selector in ('[role="graphics-document"]', "svg[aria-roledescription]", "svg"):
-        try:
-            roots = page.locator(selector)
-            texts = [
-                roots.nth(index).evaluate(
-                    """element => {
-                        const clone = element.cloneNode(true);
-                        clone.querySelectorAll('style, script, defs, title').forEach(node => node.remove());
-                        return clone.textContent || '';
-                    }"""
-                )
-                for index in range(roots.count())
-            ]
-        except Exception:
-            continue
-        values.extend(text for text in texts if text)
-        if values:
-            break
-    return _normalize_label(" ".join(values))
-
-
-def _visible_error_text(page: Any) -> str:
-    values: list[str] = []
-    for selector in ('[role="alert"]', '[data-testid*="error"]', ".error-message"):
-        try:
-            locator = page.locator(selector)
-            for index in range(min(locator.count(), 10)):
-                item = locator.nth(index)
-                if item.is_visible():
-                    text = item.text_content() or ""
-                    if text.strip():
-                        values.append(text.strip())
-        except Exception:
-            continue
-    return " | ".join(values)
-
-
-def _enable_named_switch(page: Any, name: str, timeout_ms: int = UI_ACTION_TIMEOUT_MS) -> bool:
-    switch = page.get_by_role("switch", name=name, exact=True)
-    if not switch.count() or not switch.first.is_visible():
-        return False
-    if switch.first.get_attribute("aria-checked") != "true":
-        checkbox = switch.first.locator('input[type="checkbox"]')
-        if not checkbox.count():
-            return False
-        # Clicking the real checkbox fires the component's input/change path
-        # without Playwright waiting for a constantly moving background canvas.
-        checkbox.first.evaluate(
-            "element => element.click()",
-            timeout=_ui_action_timeout(timeout_ms),
-        )
-    return switch.first.get_attribute("aria-checked") == "true"
-
-
-def _ensure_auto_update(page: Any) -> bool:
-    try:
-        return _enable_named_switch(page, "Auto-Update")
-    except Exception:
-        return False
-
-
-def _enable_auto_layout(page: Any, timeout_ms: int) -> bool:
-    return _enable_named_switch(page, "Auto-Layout toggle", timeout_ms)
-
-
-def _layout_option(page: Any, name: str) -> Any:
-    # Closed listboxes are intentionally absent from Playwright's accessibility
-    # tree, but Mermaid.ai keeps their React buttons mounted in the DOM.
-    exact_text = re.compile(rf"^\s*{re.escape(name)}\s*$")
-    return page.locator(LAYOUT_OPTION_SELECTOR).filter(has_text=exact_text)
-
-
-def _layout_option_is_selected(page: Any, name: str) -> bool:
-    option = _layout_option(page, name)
-    if not option.count():
-        return False
-    # Mermaid.ai renders the selected option's checkmark as a direct sibling of
-    # its label container. This lets us avoid opening an already-correct menu.
-    return option.first.locator(":scope > div > svg").count() > 0
-
-
-def _adaptive_layout_is_selected(page: Any) -> bool:
-    return _layout_option_is_selected(page, "Adaptive") and not _layout_option_is_selected(
-        page,
-        "Hierarchical",
+def _preview_text(session: cdp.CdpConnection) -> str:
+    value = session.evaluate(
+        """(() => {
+            for (const selector of ['[role="graphics-document"]', 'svg[aria-roledescription]', 'svg']) {
+                const values = [...document.querySelectorAll(selector)].map(element => {
+                    const clone = element.cloneNode(true);
+                    clone.querySelectorAll('style, script, defs, title').forEach(node => node.remove());
+                    return clone.textContent || '';
+                }).filter(Boolean);
+                if (values.length) return values.join(' ');
+            }
+            return '';
+        })()"""
     )
+    return _normalize_label(value if isinstance(value, str) else "")
 
 
-def _select_adaptive_layout(page: Any, timeout_ms: int) -> bool:
-    if _adaptive_layout_is_selected(page):
-        return True
+def _visible_error_text(session: cdp.CdpConnection) -> str:
+    value = session.evaluate(
+        """(() => {
+            const visible = element => !!(element &&
+                (element.offsetWidth || element.offsetHeight || element.getClientRects().length));
+            return [...document.querySelectorAll('[role="alert"], [data-testid*="error"], .error-message')]
+                .filter(visible).slice(0, 10)
+                .map(element => (element.innerText || element.textContent || '').trim())
+                .filter(Boolean);
+        })()"""
+    )
+    if not isinstance(value, list):
+        return ""
+    ignored = {"f", "fix with ai"}
+    messages: list[str] = []
+    for item in value:
+        message = str(item).strip()
+        if not message or message.lower() in ignored or message in messages:
+            continue
+        messages.append(message)
+    return " | ".join(messages)
 
-    timeout = _ui_action_timeout(timeout_ms)
-    adaptive = _layout_option(page, "Adaptive")
-    if not adaptive.count():
+
+def _enable_named_switch(session: cdp.CdpConnection, name: str) -> bool:
+    value = session.evaluate(
+        f"""(() => {{
+            const visible = element => !!(element &&
+                (element.offsetWidth || element.offsetHeight || element.getClientRects().length));
+            const name = {json.dumps(name)};
+            const element = [...document.querySelectorAll('[role="switch"]')]
+                .find(candidate => visible(candidate) && candidate.getAttribute('aria-label') === name);
+            if (!element) return false;
+            if (element.getAttribute('aria-checked') !== 'true') element.click();
+            return element.getAttribute('aria-checked') === 'true';
+        }})()"""
+    )
+    return value is True
+
+
+def _ensure_auto_update(session: cdp.CdpConnection) -> bool:
+    try:
+        return _enable_named_switch(session, "Auto-Update")
+    except cdp.CdpError:
         return False
 
-    # The layout popup remains in the DOM while closed and inert. Calling the
-    # option button directly avoids the popup animation race that otherwise
-    # leaves Auto-Layout in its default Hierarchical mode.
-    adaptive.first.evaluate("element => element.click()", timeout=timeout)
 
-    deadline = time.monotonic() + timeout / 1000
+def _enable_auto_layout(session: cdp.CdpConnection) -> bool:
+    return _enable_named_switch(session, "Auto-Layout toggle")
+
+
+def _select_adaptive_layout(session: cdp.CdpConnection, timeout_ms: int) -> bool:
+    def inspect(click: bool) -> bool:
+        value = session.evaluate(
+            f"""(() => {{
+                const options = [...document.querySelectorAll({json.dumps(LAYOUT_OPTION_SELECTOR)})];
+                const named = name => options.find(element =>
+                    (element.innerText || element.textContent || '').trim() === name);
+                const selected = element => !!element?.querySelector(':scope > div > svg');
+                const adaptive = named('Adaptive');
+                const hierarchical = named('Hierarchical');
+                if ({str(click).lower()} && adaptive && !selected(adaptive)) adaptive.click();
+                return selected(adaptive) && !selected(hierarchical);
+            }})()"""
+        )
+        return value is True
+
+    if inspect(False):
+        return True
+    inspect(True)
+    deadline = time.monotonic() + _ui_action_timeout(timeout_ms) / 1000
     while time.monotonic() < deadline:
-        if _adaptive_layout_is_selected(page):
+        if inspect(False):
             return True
-        page.wait_for_timeout(50)
-    return _adaptive_layout_is_selected(page)
+        time.sleep(0.05)
+    return inspect(False)
 
 
-def _collapse_code_panel(page: Any, editor: Any, timeout_ms: int) -> bool:
-    collapse = page.locator(CODE_PANEL_COLLAPSE_SELECTOR)
-    if not collapse.count() or not collapse.first.is_visible():
-        return not editor.is_visible()
-
-    _dispatch_background_click(collapse.first, timeout_ms)
-    try:
-        editor.wait_for(state="hidden", timeout=_ui_action_timeout(timeout_ms))
-    except Exception:
-        # The authoritative result is the current visibility. Some Mermaid.ai
-        # builds remove Monaco immediately instead of completing an animation.
-        pass
-    return not editor.is_visible()
+def _collapse_code_panel(session: cdp.CdpConnection, editor_selector: str, timeout_ms: int) -> bool:
+    collapsed = session.evaluate(
+        f"""(() => {{
+            const visible = element => !!(element &&
+                (element.offsetWidth || element.offsetHeight || element.getClientRects().length));
+            const editor = document.querySelector({json.dumps(editor_selector)});
+            const button = document.querySelector({json.dumps(CODE_PANEL_COLLAPSE_SELECTOR)});
+            if (visible(button)) button.click();
+            return !visible(editor);
+        }})()"""
+    )
+    if collapsed is True:
+        return True
+    deadline = time.monotonic() + _ui_action_timeout(timeout_ms) / 1000
+    while time.monotonic() < deadline:
+        hidden = session.evaluate(
+            f"""(() => {{
+                const element = document.querySelector({json.dumps(editor_selector)});
+                return !element || !(element.offsetWidth || element.offsetHeight || element.getClientRects().length);
+            }})()"""
+        )
+        if hidden is True:
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def _ui_action_warning(label: str, error: Exception | None = None) -> str:
@@ -865,15 +823,15 @@ def _ui_action_warning(label: str, error: Exception | None = None) -> str:
 
 
 def _configure_editor_presentation(
-    page: Any,
-    editor: Any,
+    session: cdp.CdpConnection,
+    editor_selector: str,
     timeout_ms: int,
 ) -> EditorPresentationResult:
     """Apply best-effort view preferences without invalidating a successful injection."""
     warnings: list[str] = []
 
     try:
-        auto_layout_enabled = _enable_auto_layout(page, timeout_ms)
+        auto_layout_enabled = _enable_auto_layout(session)
     except Exception as exc:
         auto_layout_enabled = False
         warnings.append(_ui_action_warning("开启 Auto-Layout", exc))
@@ -882,7 +840,7 @@ def _configure_editor_presentation(
             warnings.append(_ui_action_warning("Auto-Layout 已开启"))
 
     try:
-        adaptive_layout_selected = _select_adaptive_layout(page, timeout_ms)
+        adaptive_layout_selected = _select_adaptive_layout(session, timeout_ms)
     except Exception as exc:
         adaptive_layout_selected = False
         warnings.append(_ui_action_warning("选择 Adaptive 布局", exc))
@@ -891,7 +849,7 @@ def _configure_editor_presentation(
             warnings.append(_ui_action_warning("布局模式为 Adaptive"))
 
     try:
-        code_panel_collapsed = _collapse_code_panel(page, editor, timeout_ms)
+        code_panel_collapsed = _collapse_code_panel(session, editor_selector, timeout_ms)
     except Exception as exc:
         code_panel_collapsed = False
         warnings.append(_ui_action_warning("关闭 Code 面板", exc))
@@ -908,7 +866,7 @@ def _configure_editor_presentation(
 
 
 def _wait_for_preview(
-    page: Any,
+    session: cdp.CdpConnection,
     code: str,
     previous_preview: str,
     config: InjectConfig,
@@ -919,21 +877,30 @@ def _wait_for_preview(
     labels_to_match = labels_not_in_previous_preview or labels
     deadline = time.monotonic() + config.timeout_ms / 1000
     last_error = ""
+    blocking_error_seen_at: float | None = None
     while time.monotonic() < deadline:
         if cancelled is not None and cancelled():
             raise BrowserError("本次点击已被后续点击取代")
-        preview = _preview_text(page)
+        preview = _preview_text(session)
         if preview:
             matched = next((label for label in labels_to_match if label in preview), None)
             if matched:
-                page.wait_for_timeout(config.settle_ms)
-                if matched in _preview_text(page):
+                time.sleep(config.settle_ms / 1000)
+                if matched in _preview_text(session):
                     return f"预览中出现标签 {matched!r}"
             if not labels and preview != previous_preview:
-                page.wait_for_timeout(config.settle_ms)
+                time.sleep(config.settle_ms / 1000)
                 return "预览 DOM 已更新"
-        last_error = _visible_error_text(page) or last_error
-        page.wait_for_timeout(200)
+        current_error = _visible_error_text(session)
+        if current_error:
+            last_error = current_error
+            if "code line limit reached" in current_error.lower():
+                blocking_error_seen_at = blocking_error_seen_at or time.monotonic()
+                if time.monotonic() - blocking_error_seen_at >= 0.3:
+                    raise BrowserError(f"Mermaid.ai 拒绝本次写入；页面错误: {current_error[:400]}")
+            else:
+                blocking_error_seen_at = None
+        time.sleep(0.2)
 
     if last_error:
         raise BrowserError(f"源码已写入，但预览未成功更新；页面错误: {last_error[:400]}")
@@ -941,124 +908,153 @@ def _wait_for_preview(
     raise BrowserError(f"源码已写入，但未在超时内验证预览；候选标签: {candidates}")
 
 
-def inject_with_playwright(
+def _write_editor(session: cdp.CdpConnection, editor_selector: str, code: str) -> None:
+    focused = session.evaluate(
+        f"""(() => {{
+            const editor = document.querySelector({json.dumps(editor_selector)});
+            if (!editor) return false;
+            editor.focus();
+            return document.activeElement === editor;
+        }})()"""
+    )
+    if focused is not True:
+        raise BrowserError("Code 编辑器无法获得输入焦点；页面可能被 modal/登录层遮挡")
+    session.call("Emulation.setFocusEmulationEnabled", {"enabled": True})
+    try:
+        selected = False
+        for _attempt in range(3):
+            # CDP's editing command is exactly "selectAll". A platform-style
+            # "selectAll:" is ignored and would make insertText append instead.
+            session.call(
+                "Input.dispatchKeyEvent",
+                {
+                    "type": "rawKeyDown",
+                    "modifiers": 4,
+                    "key": "a",
+                    "code": "KeyA",
+                    "windowsVirtualKeyCode": 65,
+                    "nativeVirtualKeyCode": 0,
+                    "commands": ["selectAll"],
+                },
+            )
+            session.call(
+                "Input.dispatchKeyEvent",
+                {
+                    "type": "keyUp",
+                    "modifiers": 4,
+                    "key": "a",
+                    "code": "KeyA",
+                    "windowsVirtualKeyCode": 65,
+                    "nativeVirtualKeyCode": 0,
+                },
+            )
+            selected = session.evaluate(
+                f"""(() => {{
+                    const editor = document.querySelector({json.dumps(editor_selector)});
+                    return !!editor && (editor.value.length === 0 ||
+                        (editor.selectionStart === 0 && editor.selectionEnd === editor.value.length));
+                }})()"""
+            )
+            if selected is True:
+                break
+            session.evaluate(f"document.querySelector({json.dumps(editor_selector)})?.focus()")
+            time.sleep(0.05)
+        if selected is not True:
+            raise BrowserError("Code 编辑器没有完成全选；已停止追加写入并将重试")
+        session.call("Input.insertText", {"text": code})
+    finally:
+        try:
+            session.call("Emulation.setFocusEmulationEnabled", {"enabled": False})
+        except cdp.CdpError:
+            pass
+
+
+def inject_with_cdp(
     code: str,
     config: InjectConfig,
     *,
     target_marker: str | None = None,
     cancelled: Callable[[], bool] | None = None,
 ) -> InjectResult:
-    try:
-        from playwright.sync_api import Error as PlaywrightError
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:  # pragma: no cover - the uv wrapper supplies it
-        raise BrowserError("缺少 Playwright；请通过 inject-mermaid-ai 或 uv run 运行") from exc
-
     ensure_browser_ready(config)
 
     try:
+        browser = cdp.ChromeCdp(config.cdp_url, config.timeout_ms)
         target_created = False
-        for _connection_attempt in range(2):
-            with sync_playwright() as playwright:
-                browser = playwright.chromium.connect_over_cdp(
-                    config.cdp_url,
-                    timeout=config.timeout_ms,
-                    is_local=True,
-                    no_defaults=True,
-                )
-                page = _find_matching_page(browser, config.edit_url, target_marker)
-                if page is None and target_marker is not None:
-                    page = _wait_for_matching_page(
-                        browser,
-                        config.edit_url,
-                        config.timeout_ms,
-                        target_marker,
-                        cancelled,
-                    )
-                elif page is None and not target_created:
-                    _create_background_target(browser, config.edit_url)
-                    target_created = True
-                    # A fresh CDP connection reliably discovers Chrome targets
-                    # created with background=true; leaving this context only
-                    # disconnects Playwright and does not close external Chrome.
-                    continue
-                if page is None:
-                    page = _wait_for_matching_page(browser, config.edit_url, config.timeout_ms)
-
-                page.set_default_timeout(config.timeout_ms)
-                page.set_default_navigation_timeout(config.timeout_ms)
-                try:
-                    page.wait_for_load_state(
-                        "domcontentloaded",
-                        timeout=min(config.timeout_ms, UI_ACTION_TIMEOUT_MS),
-                    )
-                except PlaywrightError:
-                    # SPA editors can remain busy after DOMContentLoaded; the editor wait
-                    # below is the authoritative readiness check.
-                    pass
-
-                _show_injection_overlay(page)
-                editor, selector_description = _find_editor(page, config, cancelled)
-                previous_preview = _preview_text(page)
-                auto_update_enabled = _ensure_auto_update(page)
+        target = _find_matching_target(browser, config.edit_url, target_marker)
+        if target is None and target_marker is not None:
+            target = _wait_for_matching_target(
+                browser,
+                config.edit_url,
+                config.timeout_ms,
+                target_marker,
+                cancelled,
+            )
+        elif target is None:
+            target_id = browser.create_background_target(config.edit_url)
+            target_created = True
+            deadline = time.monotonic() + config.timeout_ms / 1000
+            while time.monotonic() < deadline:
+                target = browser.target_by_id(target_id)
+                if target is not None:
+                    break
                 if cancelled is not None and cancelled():
                     raise BrowserError("本次点击已被后续点击取代")
+                time.sleep(0.1)
+            if target is None:
+                raise BrowserError("已创建后台 target，但无法连接目标标签")
 
-                # Background Chrome targets can ignore key events while still
-                # accepting Input.insertText. Focus emulation makes Meta+A reach
-                # Monaco without activating the tab or foregrounding Chrome.
-                with _emulate_page_focus(page):
-                    editor.focus(timeout=config.timeout_ms)
-                    if not editor.evaluate("element => document.activeElement === element"):
-                        raise BrowserError("Code 编辑器无法获得输入焦点；页面可能被 modal/登录层遮挡")
-                    page.keyboard.press("Meta+A")
-                    page.keyboard.insert_text(code)
-                    preview_evidence = _wait_for_preview(
-                        page,
-                        code,
-                        previous_preview,
-                        config,
-                        cancelled,
+        with browser.connect(target) as session:
+            _show_injection_overlay(session)
+            editor_selector, selector_description = _find_editor(session, config, cancelled)
+            _show_injection_overlay(session)
+            _wait_for_editor_ready(session, editor_selector, config.timeout_ms)
+            previous_preview = _preview_text(session)
+            auto_update_enabled = _ensure_auto_update(session)
+            if cancelled is not None and cancelled():
+                raise BrowserError("本次点击已被后续点击取代")
+
+            _write_editor(session, editor_selector, code)
+            preview_evidence = _wait_for_preview(
+                session,
+                code,
+                previous_preview,
+                config,
+                cancelled,
+            )
+            try:
+                _remove_injection_overlay(session)
+                if target_marker is not None:
+                    session.evaluate(
+                        f"window.history.replaceState(window.history.state, '', {json.dumps(config.edit_url)})"
                     )
-                    if target_marker is not None:
-                        try:
-                            _remove_injection_overlay(page)
-                            page.evaluate(
-                                "url => window.history.replaceState(window.history.state, '', url)",
-                                config.edit_url,
-                            )
-                        except Exception as exc:
-                            raise BrowserError("源码已注入，但无法完成加载遮罩或一次性 URL 标记清理") from exc
-                    else:
-                        _remove_injection_overlay(page)
-                presentation = _configure_editor_presentation(
-                    page,
-                    editor,
-                    config.timeout_ms,
-                )
-                try:
-                    page_title = page.title()
-                except Exception:
-                    page_title = "<unavailable>"
+            except cdp.CdpError as exc:
+                raise BrowserError("源码已注入，但无法完成加载遮罩或一次性 URL 标记清理") from exc
 
-                # Do not call browser.close(): this is an externally launched Chrome
-                # and its background editor should remain available after the CLI exits.
-                return InjectResult(
-                    reused_tab=not target_created,
-                    selector_description=selector_description,
-                    preview_evidence=preview_evidence,
-                    page_title=page_title,
-                    auto_update_enabled=auto_update_enabled,
-                    presentation=presentation,
-                )
-        raise BrowserError("创建后台草稿图页面后无法重新连接")
+            presentation = _configure_editor_presentation(
+                session,
+                editor_selector,
+                config.timeout_ms,
+            )
+            page_title = session.evaluate("document.title || '<unavailable>'")
+            return InjectResult(
+                reused_tab=not target_created,
+                selector_description=selector_description,
+                preview_evidence=preview_evidence,
+                page_title=page_title if isinstance(page_title, str) else "<unavailable>",
+                auto_update_enabled=auto_update_enabled,
+                presentation=presentation,
+            )
     except MermaidAIError:
         raise
-    except PlaywrightError as exc:
-        message = str(exc).splitlines()[0]
-        raise BrowserError(f"Playwright 操作失败: {message}") from exc
+    except cdp.CdpError as exc:
+        raise BrowserError(f"目标标签 CDP 操作失败: {exc}") from exc
     except Exception as exc:
         raise BrowserError(f"浏览器注入失败: {type(exc).__name__}: {exc}") from exc
+
+
+# Backwards-compatible internal name for callers pinned to the 0.2.x module.
+inject_with_playwright = inject_with_cdp
 
 
 def positive_int(value: str) -> int:
@@ -1130,7 +1126,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
 
         config = load_config(args)
-        result = inject_with_playwright(selection.code, config)
+        result = inject_with_cdp(selection.code, config)
         target_status = "复用现有后台标签" if result.reused_tab else "新建后台标签"
         print(f"OK: {target_status}；页面={result.page_title!r}")
         print(f"OK: 已通过 {result.selector_description} 注入 {len(selection.code)} chars")

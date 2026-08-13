@@ -3,14 +3,13 @@ from __future__ import annotations
 import argparse
 import io
 import os
-import re
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from mermaid_ai_links import injector
+from mermaid_ai_links import cdp, injector
 
 
 class MermaidBlockTests(unittest.TestCase):
@@ -140,11 +139,6 @@ class PreviewLabelTests(unittest.TestCase):
         self.assertIn("World", labels)
 
     def test_waits_for_label_missing_from_previous_preview(self) -> None:
-        class FakePage:
-            @staticmethod
-            def wait_for_timeout(_milliseconds: int) -> None:
-                return None
-
         config = injector.InjectConfig(
             edit_url="https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit",
             timeout_ms=100,
@@ -157,9 +151,10 @@ class PreviewLabelTests(unittest.TestCase):
                 side_effect=["Control", "Distinctive", "Distinctive"],
             ),
             patch.object(injector, "_visible_error_text", return_value=""),
+            patch.object(injector.time, "sleep"),
         ):
             evidence = injector._wait_for_preview(
-                FakePage(),
+                object(),
                 "flowchart TB\n  Distinctive-->Control\n",
                 "Control",
                 config,
@@ -170,39 +165,29 @@ class PreviewLabelTests(unittest.TestCase):
 
 class TargetMarkerTests(unittest.TestCase):
     def test_marker_selects_only_the_clicked_mermaid_page(self) -> None:
-        class FakePage:
-            def __init__(self, url: str) -> None:
-                self.url = url
-
-        class FakeContext:
-            def __init__(self, pages: list[FakePage]) -> None:
-                self.pages = pages
-
-        class FakeBrowser:
-            def __init__(self, pages: list[FakePage]) -> None:
-                self.contexts = [FakeContext(pages)]
-
         edit_url = "https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit"
-        old_page = FakePage(edit_url)
-        clicked_page = FakePage(edit_url + "#mermaid-ai-inject=job123")
-        browser = FakeBrowser([old_page, clicked_page])
-
-        self.assertIs(old_page, injector._find_matching_page(browser, edit_url))
-        self.assertIs(
-            clicked_page,
-            injector._find_matching_page(browser, edit_url, "mermaid-ai-inject=job123"),
+        old_target = cdp.TargetInfo("old", "page", edit_url, "old", "ws://old")
+        clicked_target = cdp.TargetInfo(
+            "clicked",
+            "page",
+            edit_url + "#mermaid-ai-inject=job123",
+            "clicked",
+            "ws://clicked",
         )
 
-    def test_marker_wait_stops_when_a_newer_click_supersedes_it(self) -> None:
-        class FakeContext:
-            pages: list[object] = []
+        self.assertTrue(injector._target_matches(old_target, edit_url))
+        self.assertFalse(injector._target_matches(old_target, edit_url, "mermaid-ai-inject=job123"))
+        self.assertTrue(injector._target_matches(clicked_target, edit_url, "mermaid-ai-inject=job123"))
 
+    def test_marker_wait_stops_when_a_newer_click_supersedes_it(self) -> None:
         class FakeBrowser:
-            contexts = [FakeContext()]
+            @staticmethod
+            def find_target(_predicate: object) -> None:
+                return None
 
         edit_url = "https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit"
         with self.assertRaisesRegex(injector.BrowserError, "后续点击取代"):
-            injector._wait_for_matching_page(
+            injector._wait_for_matching_target(
                 FakeBrowser(),
                 edit_url,
                 10_000,
@@ -219,116 +204,92 @@ class TargetMarkerTests(unittest.TestCase):
 
 class InjectionStatusTests(unittest.TestCase):
     def test_waits_for_delayed_code_opener_before_finding_editor(self) -> None:
-        page = MagicMock()
-        editor = MagicMock()
-        absent_editor = MagicMock()
-        state = {"opener_probes": 0, "editor_available": False}
-
-        editor.count.side_effect = lambda: int(state["editor_available"])
-        editor.first.is_visible.return_value = True
-        absent_editor.count.return_value = 0
-        page.get_by_role.return_value = editor
-        page.locator.return_value = absent_editor
+        session = MagicMock()
+        session.evaluate.side_effect = [
+            {"selector": None, "title": "scratch", "loggedOut": False},
+            {"selector": 'textarea[aria-label="Editor content"]', "title": "scratch", "loggedOut": False},
+        ]
         config = injector.InjectConfig(
             edit_url="https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit",
             timeout_ms=1_000,
         )
 
-        def delayed_open(_page: object, _timeout_ms: int) -> bool:
-            state["opener_probes"] += 1
-            if state["opener_probes"] == 2:
-                state["editor_available"] = True
-                return True
-            return False
+        with (
+            patch.object(injector.time, "monotonic", side_effect=[0, 0.1, 0.2, 2]),
+            patch.object(injector.time, "sleep"),
+        ):
+            found, description = injector._find_editor(session, config)
+
+        self.assertEqual('textarea[aria-label="Editor content"]', found)
+        self.assertEqual('role=textbox name="Editor content"', description)
+        self.assertEqual(2, session.evaluate.call_count)
+        self.assertIn("code-editor-btn", session.evaluate.call_args_list[0].args[0])
+
+    def test_reopens_collapsed_code_panel_before_injection(self) -> None:
+        session = MagicMock()
+        session.evaluate.return_value = {
+            "selector": 'textarea[aria-label="Editor content"]',
+            "title": "scratch",
+            "loggedOut": False,
+        }
+        config = injector.InjectConfig(
+            edit_url="https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit",
+            timeout_ms=500,
+        )
+
+        injector._find_editor(session, config)
+
+        script = session.evaluate.call_args.args[0]
+        self.assertIn("if (opener) opener.click()", script)
+
+    def test_waits_for_new_editor_model_to_stabilize(self) -> None:
+        session = MagicMock()
+        session.evaluate.side_effect = [
+            {"ready": True, "enabled": True, "lines": 1, "sample": "loading"},
+            {"ready": True, "enabled": True, "lines": 3, "sample": "loaded"},
+            {"ready": True, "enabled": True, "lines": 3, "sample": "loaded"},
+            {"ready": True, "enabled": True, "lines": 3, "sample": "loaded"},
+        ]
 
         with (
             patch.object(
-                injector,
-                "_open_code_panel_if_collapsed",
-                side_effect=delayed_open,
-            ) as open_panel,
-            patch.object(injector.time, "monotonic", side_effect=[0, 0.1, 0.2, 2]),
+                injector.time,
+                "monotonic",
+                side_effect=[0, 0.1, 0.11, 0.2, 0.21, 0.3, 0.31, 0.7, 0.71],
+            ),
             patch.object(injector.time, "sleep"),
-            patch.object(injector, "_page_looks_logged_out", return_value=False),
         ):
-            found, description = injector._find_editor(page, config)
+            injector._wait_for_editor_ready(session, "textarea", 1_000)
 
-        self.assertIs(found, editor.first)
-        self.assertEqual('role=textbox name="Editor content"', description)
-        self.assertEqual(2, open_panel.call_count)
-
-    def test_reopens_collapsed_code_panel_before_injection(self) -> None:
-        page = MagicMock()
-        opener = MagicMock()
-        page.locator.return_value = opener
-        opener.count.return_value = 1
-        opener.first.is_visible.return_value = True
-
-        opened = injector._open_code_panel_if_collapsed(page, timeout_ms=500)
-
-        self.assertTrue(opened)
-        page.locator.assert_called_once_with('[data-testid="code-editor-btn"]:visible')
-        opener.first.dispatch_event.assert_called_once_with("click", timeout=500)
+        self.assertEqual(4, session.evaluate.call_count)
 
     def test_enables_auto_layout_when_switch_is_off(self) -> None:
-        page = MagicMock()
-        switch = MagicMock()
-        page.get_by_role.return_value = switch
-        switch.count.return_value = 1
-        switch.first.is_visible.return_value = True
-        switch.first.get_attribute.side_effect = ["false", "true"]
-        checkbox = switch.first.locator.return_value
-        checkbox.count.return_value = 1
+        session = MagicMock()
+        session.evaluate.return_value = True
 
-        enabled = injector._enable_auto_layout(page, timeout_ms=500)
+        enabled = injector._enable_auto_layout(session)
 
         self.assertTrue(enabled)
-        page.get_by_role.assert_called_once_with(
-            "switch",
-            name="Auto-Layout toggle",
-            exact=True,
-        )
-        switch.first.locator.assert_called_once_with('input[type="checkbox"]')
-        checkbox.first.evaluate.assert_called_once_with(
-            "element => element.click()",
-            timeout=500,
-        )
+        self.assertIn("Auto-Layout toggle", session.evaluate.call_args.args[0])
+        self.assertIn("element.click()", session.evaluate.call_args.args[0])
 
     def test_selects_adaptive_layout_without_opening_popup(self) -> None:
-        page = MagicMock()
-        options = MagicMock()
-        adaptive = MagicMock()
-        adaptive.count.return_value = 1
-        adaptive.first.locator.return_value.count.side_effect = [0, 1]
-        hierarchical = MagicMock()
-        hierarchical.count.return_value = 1
-        hierarchical.first.locator.return_value.count.return_value = 0
-
-        def by_text(*, has_text: re.Pattern[str]) -> MagicMock:
-            return adaptive if "Adaptive" in has_text.pattern else hierarchical
-
-        page.locator.return_value = options
-        options.filter.side_effect = by_text
-
-        selected = injector._select_adaptive_layout(page, timeout_ms=500)
+        session = MagicMock()
+        session.evaluate.side_effect = [False, False, True]
+        with patch.object(injector.time, "sleep"):
+            selected = injector._select_adaptive_layout(session, timeout_ms=500)
 
         self.assertTrue(selected)
-        adaptive.first.evaluate.assert_called_once_with(
-            "element => element.click()",
-            timeout=500,
-        )
-        page.locator.assert_called_with("button.listbox-item")
-        page.get_by_role.assert_not_called()
+        self.assertIn("adaptive.click()", session.evaluate.call_args_list[1].args[0])
 
     def test_editor_presentation_degrades_without_failing_injection(self) -> None:
-        page = MagicMock()
-        editor = MagicMock()
+        session = MagicMock()
         with (
             patch.object(injector, "_enable_auto_layout", side_effect=RuntimeError("UI changed")),
             patch.object(injector, "_select_adaptive_layout", return_value=False),
             patch.object(injector, "_collapse_code_panel", return_value=True),
         ):
-            result = injector._configure_editor_presentation(page, editor, timeout_ms=500)
+            result = injector._configure_editor_presentation(session, "textarea", timeout_ms=500)
 
         self.assertFalse(result.auto_layout_enabled)
         self.assertFalse(result.adaptive_layout_selected)
@@ -338,59 +299,64 @@ class InjectionStatusTests(unittest.TestCase):
         self.assertIn("Adaptive", result.warnings[1])
 
     def test_background_focus_emulation_is_scoped_and_detached(self) -> None:
-        events: list[object] = []
+        session = MagicMock()
+        session.evaluate.return_value = True
 
-        class FakeSession:
-            def send(self, method: str, params: dict[str, bool]) -> None:
-                events.append((method, params))
+        injector._write_editor(session, "textarea", "flowchart TB\nA-->B\n")
 
-            def detach(self) -> None:
-                events.append("detach")
-
-        session = FakeSession()
-
-        class FakeContext:
-            @staticmethod
-            def new_cdp_session(_page: object) -> FakeSession:
-                events.append("session")
-                return session
-
-        class FakePage:
-            context = FakeContext()
-
-        with injector._emulate_page_focus(FakePage()):
-            events.append("write")
-
+        methods = [call.args[0] for call in session.call.call_args_list]
         self.assertEqual(
             [
-                "session",
-                ("Emulation.setFocusEmulationEnabled", {"enabled": True}),
-                "write",
-                ("Emulation.setFocusEmulationEnabled", {"enabled": False}),
-                "detach",
+                "Emulation.setFocusEmulationEnabled",
+                "Input.dispatchKeyEvent",
+                "Input.dispatchKeyEvent",
+                "Input.insertText",
+                "Emulation.setFocusEmulationEnabled",
             ],
-            events,
+            methods,
         )
+        self.assertEqual(
+            ["selectAll"],
+            session.call.call_args_list[1].args[1]["commands"],
+        )
+        self.assertEqual("flowchart TB\nA-->B\n", session.call.call_args_list[3].args[1]["text"])
+
+    def test_retries_selection_before_inserting_any_text(self) -> None:
+        session = MagicMock()
+        session.evaluate.side_effect = [True, False, True, True]
+
+        with patch.object(injector.time, "sleep"):
+            injector._write_editor(session, "textarea", "flowchart TB\nA-->B\n")
+
+        methods = [call.args[0] for call in session.call.call_args_list]
+        self.assertEqual(4, methods.count("Input.dispatchKeyEvent"))
+        self.assertEqual(1, methods.count("Input.insertText"))
+        self.assertLess(methods.index("Input.dispatchKeyEvent"), methods.index("Input.insertText"))
 
     def test_loading_overlay_is_installed_and_removed_with_a_stable_id(self) -> None:
-        class FakePage:
-            def __init__(self) -> None:
-                self.calls: list[tuple[str, str]] = []
+        session = MagicMock()
+        injector._show_injection_overlay(session)
+        injector._remove_injection_overlay(session)
 
-            def evaluate(self, script: str, argument: str) -> None:
-                self.calls.append((script, argument))
+        self.assertEqual(2, session.evaluate.call_count)
+        self.assertIn("正在载入", session.evaluate.call_args_list[0].args[0])
+        self.assertIn(injector.INJECTION_OVERLAY_ID, session.evaluate.call_args_list[0].args[0])
+        self.assertIn("remove", session.evaluate.call_args_list[1].args[0])
 
-        page = FakePage()
-        injector._show_injection_overlay(page)
-        injector._remove_injection_overlay(page)
-
-        self.assertEqual(2, len(page.calls))
-        self.assertEqual(
-            [injector.INJECTION_OVERLAY_ID, injector.INJECTION_OVERLAY_ID],
-            [argument for _script, argument in page.calls],
+    def test_code_line_limit_error_fails_fast_for_bridge_retry(self) -> None:
+        session = MagicMock()
+        config = injector.InjectConfig(
+            edit_url="https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit",
+            timeout_ms=60_000,
         )
-        self.assertIn("正在载入", page.calls[0][0])
-        self.assertIn("remove", page.calls[1][0])
+        with (
+            patch.object(injector, "_preview_text", return_value="old preview"),
+            patch.object(injector, "_visible_error_text", return_value="BASIC Code line limit reached"),
+            patch.object(injector.time, "monotonic", side_effect=[0, 0.1, 0.2, 0.2, 0.4, 0.6]),
+            patch.object(injector.time, "sleep"),
+            self.assertRaisesRegex(injector.BrowserError, "Code line limit reached"),
+        ):
+            injector._wait_for_preview(session, 'flowchart TB\nnode_a["new"]\n', "old preview", config)
 
     def test_browser_preflight_fails_before_navigation_when_cdp_is_down(self) -> None:
         config = injector.InjectConfig(

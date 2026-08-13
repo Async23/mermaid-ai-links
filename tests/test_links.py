@@ -596,7 +596,7 @@ class HttpAdapterTests(unittest.TestCase):
             )
             with patch.object(
                 links.injector,
-                "inject_with_playwright",
+                "inject_with_cdp",
                 side_effect=cancellable_default_inject,
             ):
                 first = bridge.create_job(parsed.token, parsed.signature)

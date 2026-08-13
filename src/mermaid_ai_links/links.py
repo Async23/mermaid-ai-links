@@ -694,7 +694,7 @@ class MermaidBridge:
         print(f"inject start: {diagram.description}", file=sys.stderr, flush=True)
         try:
             if self._inject is None:
-                result = injector.inject_with_playwright(
+                result = injector.inject_with_cdp(
                     diagram.code,
                     self._config,
                     target_marker=target_marker,

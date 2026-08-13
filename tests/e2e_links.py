@@ -18,10 +18,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from playwright.sync_api import sync_playwright
-import websocket
-
-from mermaid_ai_links import injector, links
+from mermaid_ai_links import cdp, injector, links
 
 
 DEFAULT_NOTE = Path(__file__).resolve().parents[1] / "docs" / "C4.md"
@@ -85,20 +82,6 @@ def _prepared_note_for_e2e(
         yield staged, prepared
 
 
-def _target_page(browser: Any, target_id: str) -> Any | None:
-    for context in browser.contexts:
-        for page in context.pages:
-            try:
-                session = context.new_cdp_session(page)
-                target = session.send("Target.getTargetInfo").get("targetInfo", {})
-                session.detach()
-            except Exception:
-                continue
-            if target.get("targetId") == target_id:
-                return page
-    return None
-
-
 def _target_info(cdp_url: str, target_id: str) -> dict[str, Any] | None:
     return next((target for target in _targets(cdp_url) if target.get("id") == target_id), None)
 
@@ -113,33 +96,7 @@ def _targets(cdp_url: str) -> list[dict[str, Any]]:
 
 
 def _create_background_target(cdp_url: str, url: str) -> str:
-    with urllib.request.urlopen(cdp_url.rstrip("/") + "/json/version", timeout=2) as response:
-        version = json.loads(response.read().decode("utf-8"))
-    websocket_url = version.get("webSocketDebuggerUrl")
-    if not isinstance(websocket_url, str):
-        raise RuntimeError("CDP /json/version 没有 webSocketDebuggerUrl")
-    connection = websocket.create_connection(websocket_url, timeout=5, suppress_origin=True)
-    try:
-        request_id = 1
-        connection.send(
-            json.dumps(
-                {
-                    "id": request_id,
-                    "method": "Target.createTarget",
-                    "params": {"url": url, "background": True},
-                },
-                separators=(",", ":"),
-            )
-        )
-        while True:
-            message = json.loads(connection.recv())
-            if message.get("id") != request_id:
-                continue
-            if "error" in message:
-                raise RuntimeError(f"Target.createTarget 失败: {message['error']}")
-            return str(message["result"]["targetId"])
-    finally:
-        connection.close()
+    return cdp.ChromeCdp(cdp_url, 5_000).create_background_target(url)
 
 
 def _open_with_macos_in_background(cdp_url: str, url: str, edit_url: str) -> str:
@@ -173,98 +130,89 @@ def _close_target(cdp_url: str, target_id: str) -> None:
 
 
 def _read_target_body(config: injector.InjectConfig, target_id: str) -> str:
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.connect_over_cdp(
-            config.cdp_url,
-            timeout=config.timeout_ms,
-            is_local=True,
-            no_defaults=True,
-        )
-        page = _target_page(browser, target_id)
-        if page is None:
-            return "<target body unavailable>"
+    browser = cdp.ChromeCdp(config.cdp_url, config.timeout_ms)
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        target = browser.target_by_id(target_id)
+        if target is None:
+            time.sleep(0.05)
+            continue
         try:
-            return page.locator("body").inner_text(timeout=3_000).strip()
-        except Exception:
-            return "<target body unavailable>"
+            with browser.connect(target) as session:
+                body = session.evaluate("document.body?.innerText || ''")
+            if isinstance(body, str) and body.strip():
+                return body.strip()
+        except cdp.CdpError:
+            pass
+        time.sleep(0.05)
+    return "<target body unavailable>"
 
 
 def dump_editor_ui(config: injector.InjectConfig) -> None:
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.connect_over_cdp(
-            config.cdp_url,
-            timeout=config.timeout_ms,
-            is_local=True,
-            no_defaults=True,
+    browser = cdp.ChromeCdp(config.cdp_url, config.timeout_ms)
+    target = injector._find_matching_target(browser, config.edit_url)
+    if target is None:
+        raise RuntimeError("没有找到固定 Mermaid.ai edit 页面")
+    with browser.connect(target) as session:
+        injector._find_editor(session, config)
+        details = session.evaluate(
+            """(() => {
+                const visible = element => !!(element &&
+                    (element.offsetWidth || element.offsetHeight || element.getClientRects().length));
+                return {
+                    title: document.title,
+                    buttons: [...document.querySelectorAll('button')].filter(visible).map(button => ({
+                        text: (button.innerText || '').trim(),
+                        ariaLabel: button.getAttribute('aria-label'),
+                        title: button.getAttribute('title'),
+                        testId: button.getAttribute('data-testid')
+                    })),
+                    body: document.body?.innerText || ''
+                };
+            })()"""
         )
-        page = injector._find_matching_page(browser, config.edit_url)
-        if page is None:
-            raise RuntimeError("没有找到固定 Mermaid.ai edit 页面")
-        injector._find_editor(page, config)
-        print(f"PAGE: title={page.title()!r} url={page.url}")
-        for index in range(page.get_by_role("button").count()):
-            button = page.get_by_role("button").nth(index)
-            try:
-                if not button.is_visible():
-                    continue
-                print(
-                    "BUTTON:",
-                    {
-                        "text": (button.inner_text() or "").strip(),
-                        "aria-label": button.get_attribute("aria-label"),
-                        "title": button.get_attribute("title"),
-                        "data-testid": button.get_attribute("data-testid"),
-                    },
-                )
-            except Exception:
-                continue
-        body_lines = (page.locator("body").inner_text() or "").splitlines()
-        keywords = ("save", "saving", "saved", "保存", "update", "sync", "version")
-        for line in body_lines:
-            if any(keyword in line.lower() for keyword in keywords):
-                print(f"TEXT: {line.strip()}")
+    if not isinstance(details, dict):
+        raise RuntimeError("无法读取 Mermaid.ai 页面信息")
+    print(f"PAGE: title={details.get('title')!r} url={target.url}")
+    for button in details.get("buttons", []):
+        print("BUTTON:", button)
+    keywords = ("save", "saving", "saved", "保存", "update", "sync", "version")
+    for line in str(details.get("body", "")).splitlines():
+        if any(keyword in line.lower() for keyword in keywords):
+            print(f"TEXT: {line.strip()}")
 
 
 def blur_editor(config: injector.InjectConfig) -> None:
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.connect_over_cdp(
-            config.cdp_url,
-            timeout=config.timeout_ms,
-            is_local=True,
-            no_defaults=True,
-        )
-        page = injector._find_matching_page(browser, config.edit_url)
-        if page is None:
-            raise RuntimeError("没有找到固定 Mermaid.ai edit 页面")
-        editor, _description = injector._find_editor(page, config)
-        editor.evaluate("element => element.blur()")
-        page.wait_for_timeout(5_000)
-        print("OK: 已在后台触发 Monaco textarea blur 并等待 5 秒")
+    browser = cdp.ChromeCdp(config.cdp_url, config.timeout_ms)
+    target = injector._find_matching_target(browser, config.edit_url)
+    if target is None:
+        raise RuntimeError("没有找到固定 Mermaid.ai edit 页面")
+    with browser.connect(target) as session:
+        editor_selector, _description = injector._find_editor(session, config)
+        session.evaluate(f"document.querySelector({json.dumps(editor_selector)})?.blur()")
+    time.sleep(5)
+    print("OK: 已在后台触发 Monaco textarea blur 并等待 5 秒")
 
 
 def dump_more_menu(config: injector.InjectConfig) -> None:
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.connect_over_cdp(
-            config.cdp_url,
-            timeout=config.timeout_ms,
-            is_local=True,
-            no_defaults=True,
+    browser = cdp.ChromeCdp(config.cdp_url, config.timeout_ms)
+    target = injector._find_matching_target(browser, config.edit_url)
+    if target is None:
+        raise RuntimeError("没有找到固定 Mermaid.ai edit 页面")
+    with browser.connect(target) as session:
+        session.evaluate("document.querySelector('[data-testid=\"more-options-button\"]')?.click()")
+        time.sleep(0.3)
+        items = session.evaluate(
+            """(() => {
+                const visible = element => !!(element &&
+                    (element.offsetWidth || element.offsetHeight || element.getClientRects().length));
+                return [...document.querySelectorAll(
+                    '[role="menuitem"], [role="menu"] button, [data-radix-menu-content] *'
+                )].filter(visible).map(element => (element.innerText || '').trim()).filter(Boolean);
+            })()"""
         )
-        page = injector._find_matching_page(browser, config.edit_url)
-        if page is None:
-            raise RuntimeError("没有找到固定 Mermaid.ai edit 页面")
-        button = page.locator('[data-testid="more-options-button"]').first
-        button.evaluate("element => element.click()")
-        page.wait_for_timeout(300)
-        for selector in ('[role="menuitem"]', '[role="menu"] button', "[data-radix-menu-content] *"):
-            items = page.locator(selector)
-            for index in range(items.count()):
-                item = items.nth(index)
-                try:
-                    if item.is_visible() and (item.inner_text() or "").strip():
-                        print(f"MENU: {(item.inner_text() or '').strip()}")
-                except Exception:
-                    continue
+    for item in items if isinstance(items, list) else []:
+        print(f"MENU: {item}")
 
 
 def verify_failed_injection_replaces_stale_page(config: injector.InjectConfig) -> None:
@@ -351,9 +299,8 @@ def click_in_background_and_verify(
 ) -> tuple[str, str]:
     """Create a background Chrome target, follow the bridge redirect, and inspect preview DOM."""
     target_id = ""
-    # The raw browser-level CDP socket is closed immediately after target
-    # creation. This avoids leaving a test Playwright connection alive while the
-    # bridge independently connects to Chrome for the real injection.
+    # The browser-level CDP socket is closed immediately after target creation;
+    # the bridge independently connects only to the target tab it will inject.
     target_id = (
         _open_with_macos_in_background(config.cdp_url, url, config.edit_url)
         if via_macos_open
@@ -380,31 +327,17 @@ def click_in_background_and_verify(
         else:
             raise RuntimeError(f"后台点击未跳转到 mermaid.ai；target 最后 URL={last_url}, title={last_title!r}")
 
-        with sync_playwright() as playwright:
-            # Reconnect only after the HTTP bridge has completed and redirected.
-            inspection_browser = playwright.chromium.connect_over_cdp(
-                config.cdp_url,
-                timeout=config.timeout_ms,
-                is_local=True,
-                no_defaults=True,
-            )
-            page = None
-            while time.monotonic() < deadline:
-                page = _target_page(inspection_browser, target_id)
-                if page is not None:
-                    break
-                time.sleep(0.1)
-            if page is None:
-                raise RuntimeError(f"跳转成功但无法通过 targetId={target_id} 找到后台页面")
-
-            page.set_default_timeout(config.timeout_ms)
-            page.wait_for_load_state("domcontentloaded", timeout=config.timeout_ms)
-            injector._find_editor(page, config)
-            evidence = injector._wait_for_preview(page, expected_code, "", config)
-            final_url = page.url
-            if final_url != config.edit_url:
-                raise RuntimeError(f"预览正确但地址栏未恢复精确 edit URL: {final_url}")
-            return final_url, evidence
+        inspection_browser = cdp.ChromeCdp(config.cdp_url, config.timeout_ms)
+        target = inspection_browser.target_by_id(target_id)
+        if target is None:
+            raise RuntimeError(f"跳转成功但无法通过 targetId={target_id} 找到后台页面")
+        with inspection_browser.connect(target) as session:
+            injector._find_editor(session, config)
+            evidence = injector._wait_for_preview(session, expected_code, "", config)
+            final_url = session.evaluate("location.href")
+        if final_url != config.edit_url:
+            raise RuntimeError(f"预览正确但地址栏未恢复精确 edit URL: {final_url}")
+        return final_url, evidence
     finally:
         if target_id:
             _close_target(config.cdp_url, target_id)

@@ -1,9 +1,10 @@
 # Copy to ~/.config/mermaid-ai-inject/config.yaml (never commit the real file).
 edit_url: "https://mermaid.ai/app/projects/PROJECT_ID/diagrams/DIAGRAM_ID/version/v0.1/edit"
 
-# Connect to an already-running Chrome. For Markdown links, macOS external URLs
-# must open in this same Chrome instance so the bridge can identify the clicked
-# tab by its one-time fragment. The CLI never activates a tab itself.
+# Connect to an already-running daily or dedicated Chrome. For Markdown links,
+# macOS external URLs must open in this same Chrome instance so the bridge can
+# identify the clicked tab by its one-time fragment. The injector connects only
+# to that target's CDP WebSocket and never activates or initializes other tabs.
 cdp_url: "http://127.0.0.1:9222"
 timeout_ms: 60000
 settle_ms: 1500

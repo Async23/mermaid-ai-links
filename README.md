@@ -38,7 +38,7 @@ Markdown link
   -> 返回已完整加载的本机等待页并预检 Chrome/CDP
   -> 等待页把同一个标签导航到带一次性 job fragment 的固定 edit URL
   -> 服务通过 Chrome CDP 只锁定这个标签并读取当前 Mermaid 源码
-  -> 页内显示“正在载入”遮罩，Playwright 写入固定 __inject_scratch__ 并验证预览
+  -> 页内显示“正在载入”遮罩，单目标 CDP 通道写入固定 __inject_scratch__ 并验证预览
   -> 瞬时故障在同一标签自动重试一次；最终失败则把该标签替换成本机错误页
   -> 移除一次性 fragment，地址栏恢复精确 mermaid.ai edit URL
 ```
@@ -57,6 +57,7 @@ Markdown link
 - `HEAD` 请求绝不触发注入，避免 Markdown 预览器的链接探测产生副作用。
 - 当前只支持手动 `start/status/stop`，**不会创建、加载或修改 macOS LaunchAgent**。
 - HTTP 点击只更新带本次 marker 的标签；CLI/MCP 会复用或创建后台草稿标签。两条链路都只用 CDP focus emulation 驱动 Monaco，不会把 Chrome 或标签切到前台。
+- CDP 适配器只打开目标 Mermaid.ai 标签自身的 WebSocket，不会 attach、初始化或等待日常 Chrome 中的其他页面；连接不会再被其他页面的加载状态拖住。
 - 注入期间会遮住共用草稿的旧内容；成功才显示新图。瞬时故障自动重试一次，最终失败会显示错误与“重新尝试”，不会让旧图冒充本次结果。
 - 每次失败及重试都会写入持久日志，包含 `job_id`、尝试次数和具体错误。
 - 系统外链必须交给 `cdp_url` 所指向的同一个 Chrome 实例；仓库提供真实 E2E 脚本用于本机验收。
@@ -69,7 +70,9 @@ Markdown link
 https://mermaid.ai/app/projects/<PROJECT_ID>/diagrams/<DIAGRAM_ID>/version/<VERSION>/edit
 ```
 
-建议图名 `__inject_scratch__`。Chrome 启动命令：
+建议图名 `__inject_scratch__`。如果日常 Chrome 已经始终带 `--remote-debugging-port=9222` 运行，就直接使用该实例；不需要再启动第二个 Chrome。工具只连接本次 Mermaid.ai 标签，不会枚举后再初始化其余日常页面。
+
+如果尚未给任何 Chrome 开启 CDP，也可以选择单独 profile，启动命令为：
 
 ```zsh
 CHROME='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
@@ -81,7 +84,7 @@ PROFILE="$HOME/Library/Application Support/Google/Chrome-Mermaid-AI"
   --no-default-browser-check
 ```
 
-首次需要在这个 profile 中登录 Mermaid.ai。Typora、VS Code、Obsidian 点击外链时也必须由这个 Chrome 实例接收；否则服务无法锁定“刚点击的标签”。检查 CDP：
+首次需要在所用 Chrome 中登录 Mermaid.ai。Typora、VS Code、Obsidian 点击外链时也必须由 `cdp_url` 对应的同一个 Chrome 实例接收；否则服务无法锁定“刚点击的标签”。检查 CDP：
 
 ```zsh
 curl -fsS http://127.0.0.1:9222/json/version
@@ -94,10 +97,10 @@ curl -fsS http://127.0.0.1:9222/json/version
 - macOS
 - Python 3.11 或更高版本
 - [`uv`](https://docs.astral.sh/uv/)
-- Google Chrome，以及一个专门用于 Mermaid Chart 的浏览器 profile
+- 一个始终开启 CDP 的 Google Chrome（可使用日常实例，也可使用单独 profile）
 - 可编辑的 Mermaid Chart 草稿图
 
-项目使用 `uv` 管理环境和命令入口，连接系统 Chrome，不下载 Playwright 自带浏览器。普通安装：
+项目使用 `uv` 管理环境和命令入口，通过目标标签的原生 CDP WebSocket 连接系统 Chrome，不下载或启动内置浏览器。普通安装：
 
 ```zsh
 uv tool install git+https://github.com/Async23/mermaid-ai-links.git@v0.2.0
@@ -219,7 +222,7 @@ mermaid-ai-links doctor
 2. VS Code：在 Markdown Preview 中点击；源码编辑区可按住编辑器要求的修饰键点击。
 3. Obsidian：阅读视图直接点击；编辑视图按 Obsidian 的外链方式点击。
 
-三者都把同一条标准 HTTP URL 交给系统浏览器。链接先完整加载一个很短的本机等待页，再把同一标签导航到带一次性 fragment 的固定 edit URL。服务只注入这个标签，预览通过后用 `history.replaceState` 移除 fragment，最终地址栏就是固定图的精确 URL。这个两阶段顺序避免了待响应本机导航与 Playwright 初始化互相等待，也不依赖 Mermaid.ai 把临时源码先保存到远端。
+三者都把同一条标准 HTTP URL 交给系统浏览器。链接先完整加载一个很短的本机等待页，再把同一标签导航到带一次性 fragment 的固定 edit URL。服务从 `/json/list` 精确找到这个标签，只连接它自己的 CDP WebSocket；不会 attach 日常 Chrome 中的其他页面。预览通过后用 `history.replaceState` 移除 fragment，最终地址栏就是固定图的精确 URL。这个两阶段顺序不依赖 Mermaid.ai 把临时源码先保存到远端。
 
 Mermaid.ai 页面出现后会先覆盖“正在载入这条 Markdown 对应的 Mermaid 图…”遮罩，遮罩消失且地址栏不再含 `#mermaid-ai-inject=...` 才表示完成。若第一次遇到瞬时 CDP/Monaco 故障，服务会在同一页自动重试一次；仍失败时该页会自动跳回本机错误页，显示原因和“重新尝试”入口。
 
@@ -324,11 +327,11 @@ curl -fsS http://127.0.0.1:9222/json/version
 lsof -nP -iTCP:9222 -sTCP:LISTEN
 ```
 
-默认 `launch_if_needed: false`。服务不会因为一次点击而弹出 Chrome；请手动启动专用 profile。
+默认 `launch_if_needed: false`。服务不会因为一次点击而弹出 Chrome；请确认日常 Chrome 已带 9222 启动，或手动启动单独 profile。
 
 ### Mermaid.ai 未登录、编辑器超时或预览报错
 
-- 在同一专用 Chrome profile 中确认登录与草稿图编辑权限。
+- 在 `cdp_url` 对应的同一 Chrome 中确认登录与草稿图编辑权限。
 - 确认页面是 Code Editor 且 Auto-Update 可用。
 - 查看 `~/.local/state/mermaid-ai-inject/link-server.log`。
 - 先用 `inject-mermaid-ai --dry-run` 确认提取到的源码。

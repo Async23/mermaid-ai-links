@@ -4,6 +4,9 @@
 
 - 打开图后自动启用 Auto-Layout、选择 Adaptive，并收起 Code 面板；下次注入会在后台自动重新展开。
 - 修复新标签加载竞态，避免 Code 控件延迟挂载时空等超时；关闭布局弹层时也能可靠选择 Adaptive。
+- 浏览器注入改为只连接目标标签的原生 CDP WebSocket，避免日常 Chrome 页面较多时初始化所有页面导致 60 秒连接超时。
+- 移除 Playwright 运行时依赖；`doctor` 仍执行真实 CDP 协议往返，但不会 attach 任一页面。
+- 修正 CDP `selectAll` 编辑命令并在写入前验证全选，避免源码被误追加后触发假的 `Code line limit reached`；新标签还会等待 Monaco 模型稳定。
 
 ## 0.2.0
 
