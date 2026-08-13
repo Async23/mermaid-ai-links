@@ -342,6 +342,7 @@ class HttpAdapterTests(unittest.TestCase):
                     self.assertEqual(202, started_response.status)
                     started_job = links.json.loads(started_response.read().decode("utf-8"))
                 self.assertIn(f"#mermaid-ai-inject={job_id}", started_job["navigate_url"])
+                self.assertEqual(started_job["outcome_url"], started_job["failure_url"])
 
                 deadline = time.monotonic() + 3
                 job = {}
@@ -619,6 +620,63 @@ class HttpAdapterTests(unittest.TestCase):
             self.assertEqual(2, len(targets))
             self.assertTrue(outcome_presented.wait(timeout=1))
             self.assertEqual([first.outcome_url], presented_outcomes)
+
+    def test_receipt_returned_after_supersession_cannot_commit_stale_success(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "note.md"
+            secret_path = Path(directory) / "secret"
+            origin = f"http://127.0.0.1:{free_port()}"
+            path.write_text("```mermaid\nA-->LatestClick\n```\n", encoding="utf-8")
+            links.sync_file(path, origin=origin, secret_path=secret_path)
+            parsed = first_app_link(path.read_text(encoding="utf-8"))
+            secret = links.load_or_create_secret(secret_path, create=False)
+            first_started = threading.Event()
+            outcome_presented = threading.Event()
+            call_count = 0
+
+            def late_receipt(
+                _code: str,
+                _target: ScriptedPreparedTarget | None,
+                superseded: automation.SupersessionProbe,
+            ) -> automation.InjectionAttempt:
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    first_started.set()
+                    deadline = time.monotonic() + 2
+                    while not superseded() and time.monotonic() < deadline:
+                        time.sleep(0.005)
+                    if not superseded():
+                        raise AssertionError("旧任务没有收到任务取代信号")
+                    return receipt("stale receipt returned after supersession")
+                return receipt("latest receipt")
+
+            def record_outcome(_target: ScriptedPreparedTarget, _url: str) -> None:
+                outcome_presented.set()
+
+            browser = ScriptedMermaidAIAdapter(attempt=late_receipt, on_navigate=record_outcome)
+            bridge = links.MermaidBridge(secret, browser, origin=origin, retry_delay_seconds=0)
+            first = bridge.create_job(parsed.token, parsed.signature)
+            bridge.start_job(first.job_id)
+            self.assertTrue(first_started.wait(timeout=1))
+
+            second = bridge.create_job(parsed.token, parsed.signature)
+            bridge.start_job(second.job_id)
+
+            deadline = time.monotonic() + 2
+            first_snapshot = bridge.get_job(first.job_id)
+            second_snapshot = bridge.get_job(second.job_id)
+            while (
+                first_snapshot.state is links.JobState.RUNNING or second_snapshot.state is links.JobState.RUNNING
+            ) and time.monotonic() < deadline:
+                time.sleep(0.01)
+                first_snapshot = bridge.get_job(first.job_id)
+                second_snapshot = bridge.get_job(second.job_id)
+
+            self.assertIs(links.JobState.SUPERSEDED, first_snapshot.state)
+            self.assertIsNone(first_snapshot.error)
+            self.assertIs(links.JobState.SUCCEEDED, second_snapshot.state)
+            self.assertTrue(outcome_presented.wait(timeout=1))
 
     def test_preflight_failure_keeps_the_user_on_the_local_waiting_page(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -26,6 +26,7 @@ import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
+from enum import StrEnum
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -49,7 +50,9 @@ OPEN_PATH_RE = re.compile(r"^/v1/open/(?P<token>[A-Za-z0-9_-]+)\.(?P<signature>[
 REPAIR_PATH_RE = re.compile(r"^/v1/repair/(?P<token>[A-Za-z0-9_-]+)\.(?P<signature>[A-Za-z0-9_-]+)$")
 JOB_PATH_RE = re.compile(r"^/v1/jobs/(?P<job_id>[A-Za-z0-9_-]{32})$")
 JOB_START_PATH_RE = re.compile(r"^/v1/jobs/(?P<job_id>[A-Za-z0-9_-]{32})/start$")
-JOB_OUTCOME_PATH_RE = re.compile(r"^/v1/jobs/(?P<job_id>[A-Za-z0-9_-]{32})/failure$")
+# The v1 endpoint keeps its original /failure path for existing links even
+# though it now renders both failed and superseded terminal outcomes.
+LEGACY_JOB_OUTCOME_PATH_RE = re.compile(r"^/v1/jobs/(?P<job_id>[A-Za-z0-9_-]{32})/failure$")
 CONTROL_OPEN_PATH = "/v1/control/open"
 CONTROL_MAX_REQUEST_BYTES = 8 * 1024
 CONTROL_OPEN_TIMEOUT_SECONDS = 90
@@ -93,6 +96,14 @@ class LinkPlacementError(LinkError):
 
 class BridgeError(RuntimeError):
     """The local bridge could not complete a requested injection."""
+
+
+class JobState(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    SUPERSEDED = "superseded"
 
 
 @dataclass(frozen=True)
@@ -146,7 +157,7 @@ class BridgeOpenResult:
 @dataclass(frozen=True)
 class JobSnapshot:
     job_id: str
-    state: str
+    state: JobState
     attempts: int = 0
     max_attempts: int = DEFAULT_MAX_INJECTION_ATTEMPTS
     navigate_url: str | None = None
@@ -155,6 +166,11 @@ class JobSnapshot:
     edit_url: str | None = None
     evidence: str | None = None
     error: str | None = None
+
+    @property
+    def failure_url(self) -> str | None:
+        """Compatibility alias retained for v1 clients."""
+        return self.outcome_url
 
 
 @dataclass
@@ -166,7 +182,7 @@ class _BridgeJob:
     outcome_url: str
     retry_url: str
     created_at: float
-    state: str = "pending"
+    state: JobState = JobState.PENDING
     attempts: int = 0
     result: BridgeOpenResult | None = None
     error: str | None = None
@@ -698,8 +714,7 @@ class MermaidBridge:
         if isinstance(attempt, automation.AttemptSuperseded):
             return attempt
         print(
-            f"inject OK: block_id={diagram.block_id}; elapsed={time.monotonic() - started:.2f}s; "
-            f"{attempt.evidence}",
+            f"inject OK: block_id={diagram.block_id}; elapsed={time.monotonic() - started:.2f}s; {attempt.evidence}",
             file=sys.stderr,
             flush=True,
         )
@@ -739,11 +754,11 @@ class MermaidBridge:
             job = self._jobs.get(job_id)
             if job is None:
                 raise LinkError("注入任务不存在或已过期，请重新点击 Markdown 链接")
-            if job.state == "pending":
+            if job.state is JobState.PENDING:
                 try:
                     target = self._adapter.prepare_target(job_id)
                 except automation.AutomationError as exc:
-                    job.state = "failed"
+                    job.state = JobState.FAILED
                     job.error = str(exc) or type(exc).__name__
                     print(
                         f"inject FAILED before navigation: job_id={job_id}; error={job.error}",
@@ -754,9 +769,9 @@ class MermaidBridge:
                     job.target = target
                     job.navigate_url = target.navigation_url
                     for existing in self._jobs.values():
-                        if existing.job_id != job_id and existing.state == "running":
+                        if existing.job_id != job_id and existing.state is JobState.RUNNING:
                             existing.superseded.set()
-                    job.state = "running"
+                    job.state = JobState.RUNNING
                     worker = threading.Thread(
                         target=self._run_job,
                         args=(job_id,),
@@ -819,11 +834,12 @@ class MermaidBridge:
 
         result: BridgeOpenResult | None = None
         last_error = "未知注入错误"
-        was_superseded = False
+        observed_supersession = False
+        final_state: JobState | None = None
         with self._inject_lock:
             for attempt in range(1, self._max_injection_attempts + 1):
                 if superseded.is_set():
-                    was_superseded = True
+                    observed_supersession = True
                     print(
                         f"inject superseded before attempt: job_id={job_id}",
                         file=sys.stderr,
@@ -849,7 +865,7 @@ class MermaidBridge:
                 except BridgeError as exc:
                     last_error = str(exc)
                     if superseded.is_set():
-                        was_superseded = True
+                        observed_supersession = True
                         print(
                             f"inject superseded: job_id={job_id}; attempt={attempt}",
                             file=sys.stderr,
@@ -870,32 +886,42 @@ class MermaidBridge:
                     break
                 else:
                     if isinstance(outcome, automation.AttemptSuperseded):
-                        was_superseded = True
+                        observed_supersession = True
                     else:
                         result = outcome
                     break
 
-            if result is None and was_superseded:
-                with self._jobs_lock:
-                    current = self._jobs.get(job_id)
-                    if current is None:
-                        return
-                    current.state = "superseded"
-                    current.error = None
-                    current.superseded_presentation_pending = True
-            else:
-                self._present_pending_superseded_outcomes()
-
-        if was_superseded:
-            return
-
-        if result is None:
+            # This lock is the linearization point shared with start_job(). A
+            # newer job either marks this one superseded before this commit, or
+            # observes an already-terminal state and leaves it unchanged.
             with self._jobs_lock:
                 current = self._jobs.get(job_id)
                 if current is None:
                     return
-                current.state = "failed"
-                current.error = last_error
+                if observed_supersession or current.superseded.is_set():
+                    final_state = JobState.SUPERSEDED
+                    current.state = final_state
+                    current.result = None
+                    current.error = None
+                    current.superseded_presentation_pending = True
+                elif result is None:
+                    final_state = JobState.FAILED
+                    current.state = final_state
+                    current.result = None
+                    current.error = last_error
+                else:
+                    final_state = JobState.SUCCEEDED
+                    current.state = final_state
+                    current.result = result
+                    current.error = None
+
+            if final_state is not JobState.SUPERSEDED:
+                self._present_pending_superseded_outcomes()
+
+        if final_state is JobState.SUPERSEDED:
+            return
+
+        if final_state is JobState.FAILED:
             try:
                 target.navigate_to(outcome_url)
             except automation.AutomationError as exc:
@@ -906,17 +932,14 @@ class MermaidBridge:
                 )
             else:
                 print(f"inject failure page shown: job_id={job_id}", file=sys.stderr, flush=True)
-            return
-
-        with self._jobs_lock:
-            current = self._jobs.get(job_id)
-            if current is not None:
-                current.state = "succeeded"
-                current.result = result
 
     def _cleanup_jobs_locked(self) -> None:
         cutoff = time.monotonic() - 300
-        expired = [job_id for job_id, job in self._jobs.items() if job.created_at < cutoff and job.state != "running"]
+        expired = [
+            job_id
+            for job_id, job in self._jobs.items()
+            if job.created_at < cutoff and job.state is not JobState.RUNNING
+        ]
         for job_id in expired:
             del self._jobs[job_id]
 
@@ -1017,7 +1040,7 @@ def _html_page(title: str, message: str) -> HtmlPage:
 
 
 def _outcome_page(snapshot: JobSnapshot) -> HtmlPage:
-    if snapshot.state == "superseded":
+    if snapshot.state is JobState.SUPERSEDED:
         return _render_page(
             "已切换到更新的 Mermaid 图",
             "<h1>已切换到更新的 Mermaid 图</h1><p>这项注入任务已被后续任务取代，请查看最新打开的 Mermaid.ai 标签。</p>",
@@ -1163,6 +1186,7 @@ def make_http_handler(bridge: MermaidBridge, settings: ServerSettings) -> type[B
                 value["navigate_url"] = snapshot.navigate_url
             if snapshot.outcome_url:
                 value["outcome_url"] = snapshot.outcome_url
+                value["failure_url"] = snapshot.failure_url
             if snapshot.retry_url:
                 value["retry_url"] = snapshot.retry_url
             if snapshot.edit_url:
@@ -1236,17 +1260,17 @@ def make_http_handler(bridge: MermaidBridge, settings: ServerSettings) -> type[B
                     return
                 self._send_json(HTTPStatus.OK, self._job_json(snapshot))
                 return
-            outcome_match = JOB_OUTCOME_PATH_RE.fullmatch(parsed.path)
+            outcome_match = LEGACY_JOB_OUTCOME_PATH_RE.fullmatch(parsed.path)
             if outcome_match and not parsed.query and not parsed.fragment:
                 try:
                     snapshot = bridge.get_job(outcome_match.group("job_id"))
                 except LinkError as exc:
                     self._send_page(HTTPStatus.NOT_FOUND, _html_page("注入任务已过期", str(exc)))
                     return
-                if snapshot.state not in {"failed", "superseded"}:
+                if snapshot.state not in {JobState.FAILED, JobState.SUPERSEDED}:
                     self._send_page(
                         HTTPStatus.CONFLICT,
-                        _html_page("注入任务尚未失败", f"当前状态：{snapshot.state}"),
+                        _html_page("注入任务尚无最终结果", f"当前状态：{snapshot.state}"),
                     )
                     return
                 self._send_page(HTTPStatus.OK, _outcome_page(snapshot))

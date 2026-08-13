@@ -169,6 +169,7 @@ class InjectResult:
     page_title: str
     auto_update_enabled: bool
     presentation: EditorPresentationResult = field(default_factory=EditorPresentationResult)
+    target_id: str | None = None
 
 
 def _without_newline(line: str) -> str:
@@ -522,7 +523,13 @@ def _validate_outcome_url(outcome_url: str) -> str:
     return outcome_url
 
 
-def present_outcome_page(config: InjectConfig, target_marker: str, outcome_url: str) -> None:
+def present_outcome_page(
+    config: InjectConfig,
+    target_marker: str,
+    outcome_url: str,
+    *,
+    target_id: str | None = None,
+) -> None:
     """Replace the exact Mermaid.ai tab with the job's local terminal outcome."""
     destination = _validate_outcome_url(outcome_url)
     if not _cdp_is_ready(config.cdp_url):
@@ -530,7 +537,9 @@ def present_outcome_page(config: InjectConfig, target_marker: str, outcome_url: 
     timeout_ms = min(config.timeout_ms, 10_000)
     try:
         browser = cdp.ChromeCdp(config.cdp_url, timeout_ms)
-        target = _find_matching_target(browser, config.edit_url, target_marker)
+        target = browser.target_by_id(target_id) if target_id is not None else None
+        if target is None:
+            target = _find_matching_target(browser, config.edit_url, target_marker)
         if target is None:
             target = _wait_for_matching_target(browser, config.edit_url, timeout_ms, target_marker)
         with browser.connect(target) as session:
@@ -1026,6 +1035,14 @@ def inject_with_cdp(
                 config,
                 superseded,
             )
+            presentation = _configure_editor_presentation(
+                session,
+                editor_selector,
+                config.timeout_ms,
+            )
+            page_title = session.evaluate("document.title || '<unavailable>'")
+            if superseded is not None and superseded():
+                raise InjectionSuperseded("本次注入任务已被后续任务取代")
             try:
                 _remove_injection_overlay(session)
                 if target_marker is not None:
@@ -1035,12 +1052,6 @@ def inject_with_cdp(
             except cdp.CdpError as exc:
                 raise BrowserError("源码已注入，但无法完成加载遮罩或一次性 URL 标记清理") from exc
 
-            presentation = _configure_editor_presentation(
-                session,
-                editor_selector,
-                config.timeout_ms,
-            )
-            page_title = session.evaluate("document.title || '<unavailable>'")
             return InjectResult(
                 reused_tab=not target_created,
                 selector_description=selector_description,
@@ -1048,6 +1059,7 @@ def inject_with_cdp(
                 page_title=page_title if isinstance(page_title, str) else "<unavailable>",
                 auto_update_enabled=auto_update_enabled,
                 presentation=presentation,
+                target_id=target.target_id,
             )
     except MermaidAIError:
         raise
@@ -1055,6 +1067,10 @@ def inject_with_cdp(
         raise BrowserError(f"目标标签 CDP 操作失败: {exc}") from exc
     except Exception as exc:
         raise BrowserError(f"浏览器注入失败: {type(exc).__name__}: {exc}") from exc
+
+
+def _automation_error(exc: MermaidAIError) -> automation.AutomationError:
+    return automation.AutomationError(str(exc))
 
 
 def _injection_receipt(code: str, config: InjectConfig, result: InjectResult) -> automation.InjectionReceipt:
@@ -1080,11 +1096,12 @@ def _injection_receipt(code: str, config: InjectConfig, result: InjectResult) ->
     )
 
 
-@dataclass(frozen=True)
+@dataclass
 class _ChromePreparedTarget:
     _config: InjectConfig
     _marker: str
     navigation_url: str
+    _target_id: str | None = field(default=None, init=False, repr=False)
 
     def inject(
         self,
@@ -1102,14 +1119,20 @@ class _ChromePreparedTarget:
         except InjectionSuperseded:
             return automation.AttemptSuperseded()
         except MermaidAIError as exc:
-            raise automation.AutomationError(str(exc)) from exc
+            raise _automation_error(exc) from exc
+        self._target_id = result.target_id
         return _injection_receipt(code, self._config, result)
 
     def navigate_to(self, destination: str) -> None:
         try:
-            present_outcome_page(self._config, self._marker, destination)
+            present_outcome_page(
+                self._config,
+                self._marker,
+                destination,
+                target_id=self._target_id,
+            )
         except MermaidAIError as exc:
-            raise automation.AutomationError(str(exc)) from exc
+            raise _automation_error(exc) from exc
 
 
 class ChromeMermaidAIAdapter:
@@ -1141,7 +1164,7 @@ class ChromeMermaidAIAdapter:
                 editor_selector_override=editor_selector_override,
             )
         except MermaidAIError as exc:
-            raise automation.AutomationError(str(exc)) from exc
+            raise _automation_error(exc) from exc
         return cls(config)
 
     def readiness(self) -> automation.AutomationReadiness:
@@ -1156,7 +1179,7 @@ class ChromeMermaidAIAdapter:
         except InjectionSuperseded as exc:  # pragma: no cover - direct injection has no probe
             raise automation.AutomationError("直接注入意外观察到任务取代") from exc
         except MermaidAIError as exc:
-            raise automation.AutomationError(str(exc)) from exc
+            raise _automation_error(exc) from exc
         return _injection_receipt(code, self._config, result)
 
     def prepare_target(self, job_id: str) -> automation.PreparedTarget:
@@ -1165,7 +1188,7 @@ class ChromeMermaidAIAdapter:
         try:
             ensure_browser_ready(self._config)
         except MermaidAIError as exc:
-            raise automation.AutomationError(str(exc)) from exc
+            raise _automation_error(exc) from exc
         marker = f"mermaid-ai-inject={job_id}"
         parsed_edit_url = urlsplit(self._config.edit_url)
         navigation_url = urlunsplit(

@@ -343,6 +343,55 @@ class InjectionStatusTests(unittest.TestCase):
         self.assertIn(injector.INJECTION_OVERLAY_ID, session.evaluate.call_args_list[0].args[0])
         self.assertIn("remove", session.evaluate.call_args_list[1].args[0])
 
+    def test_target_marker_is_cleared_only_after_all_success_checks(self) -> None:
+        events: list[str] = []
+        config = injector.InjectConfig(edit_url="https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit")
+        target = cdp.TargetInfo("target-7", "page", config.edit_url, "scratch", "ws://target-7")
+        browser = MagicMock()
+        session = MagicMock()
+        browser.connect.return_value.__enter__.return_value = session
+
+        def evaluate(script: str) -> str | None:
+            if "document.title" in script:
+                events.append("title")
+                return "scratch"
+            if "replaceState" in script:
+                events.append("marker")
+            return None
+
+        session.evaluate.side_effect = evaluate
+        with (
+            patch.object(injector, "ensure_browser_ready"),
+            patch.object(injector.cdp, "ChromeCdp", return_value=browser),
+            patch.object(injector, "_find_matching_target", return_value=target),
+            patch.object(injector, "_show_injection_overlay"),
+            patch.object(injector, "_find_editor", return_value=("textarea", "fake editor")),
+            patch.object(injector, "_wait_for_editor_ready"),
+            patch.object(injector, "_preview_text", return_value="old preview"),
+            patch.object(injector, "_ensure_auto_update", return_value=True),
+            patch.object(injector, "_write_editor"),
+            patch.object(injector, "_wait_for_preview", return_value="preview contains B"),
+            patch.object(
+                injector,
+                "_configure_editor_presentation",
+                side_effect=lambda *_args: events.append("presentation") or injector.EditorPresentationResult(),
+            ),
+            patch.object(
+                injector,
+                "_remove_injection_overlay",
+                side_effect=lambda *_args: events.append("remove"),
+            ),
+        ):
+            result = injector.inject_with_cdp(
+                "A-->B",
+                config,
+                target_marker="mermaid-ai-inject=job123",
+                superseded=lambda: False,
+            )
+
+        self.assertEqual(["presentation", "title", "remove", "marker"], events)
+        self.assertEqual("target-7", result.target_id)
+
     def test_code_line_limit_error_fails_fast_for_bridge_retry(self) -> None:
         session = MagicMock()
         config = injector.InjectConfig(
@@ -372,9 +421,7 @@ class InjectionStatusTests(unittest.TestCase):
 
 class ChromeMermaidAIAdapterTests(unittest.TestCase):
     def test_prepared_target_hides_marker_and_returns_typed_supersession(self) -> None:
-        config = injector.InjectConfig(
-            edit_url="https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit"
-        )
+        config = injector.InjectConfig(edit_url="https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit")
         adapter = injector.ChromeMermaidAIAdapter(config)
 
         with patch.object(injector, "ensure_browser_ready"):
@@ -392,10 +439,35 @@ class ChromeMermaidAIAdapterTests(unittest.TestCase):
         self.assertEqual("mermaid-ai-inject=job123", inject.call_args.kwargs["target_marker"])
         self.assertTrue(inject.call_args.kwargs["superseded"]())
 
-    def test_direct_injection_returns_stable_receipt(self) -> None:
-        config = injector.InjectConfig(
-            edit_url="https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit"
+    def test_prepared_target_keeps_exact_target_id_after_marker_cleanup(self) -> None:
+        config = injector.InjectConfig(edit_url="https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit")
+        result = injector.InjectResult(
+            reused_tab=True,
+            selector_description="fake editor",
+            preview_evidence="preview contains B",
+            page_title="fake",
+            auto_update_enabled=True,
+            target_id="target-7",
         )
+        adapter = injector.ChromeMermaidAIAdapter(config)
+        with patch.object(injector, "ensure_browser_ready"):
+            target = adapter.prepare_target("job123")
+        with patch.object(injector, "inject_with_cdp", return_value=result):
+            target.inject("A-->B", superseded=lambda: False)
+
+        destination = "http://127.0.0.1:38473/v1/jobs/job123/failure"
+        with patch.object(injector, "present_outcome_page") as present:
+            target.navigate_to(destination)
+
+        present.assert_called_once_with(
+            config,
+            "mermaid-ai-inject=job123",
+            destination,
+            target_id="target-7",
+        )
+
+    def test_direct_injection_returns_stable_receipt(self) -> None:
+        config = injector.InjectConfig(edit_url="https://mermaid.ai/app/projects/p/diagrams/d/version/v0.1/edit")
         result = injector.InjectResult(
             reused_tab=True,
             selector_description="fake editor",
