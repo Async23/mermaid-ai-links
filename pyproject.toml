@@ -35,7 +35,7 @@ inject-mermaid-ai = "mermaid_ai_links.injector:main"
 
 [dependency-groups]
 dev = [
-  "ruff>=0.15,<0.16",
+  "ruff>=0.16.2,<0.17",
 ]
 
 [build-system]
