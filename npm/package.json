@@ -1,6 +1,6 @@
 {
   "name": "mermaid-ai-links",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Open the latest Mermaid block from Markdown in a shared Mermaid.ai scratch diagram.",
   "type": "module",
   "bin": {
@@ -39,6 +39,7 @@
   "homepage": "https://github.com/Async23/mermaid-ai-links#readme",
   "license": "MIT",
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "provenance": true
   }
 }

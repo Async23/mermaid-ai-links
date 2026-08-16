@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.3
+
+- 将 `cryptography` 从 49.0.0 升级到 50.0.0，修复 CVE-2026-69247 / GHSA-g6cj-pr64-35w5。
+- npm 发布改用 GitHub Actions OIDC Trusted Publishing，并生成 SLSA provenance。
+
 ## 0.2.2
 
 - 新增 Chrome / Mermaid.ai Adapter 深模块边界，集中封装浏览器配置、一次性 marker、精确目标标签、Monaco 写入和预览验证。
