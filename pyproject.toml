@@ -1,6 +1,6 @@
 [project]
 name = "mermaid-ai-links"
-version = "0.2.2"
+version = "0.2.3"
 description = "Open the latest Mermaid block from any Markdown file in a fixed Mermaid.ai scratch diagram."
 readme = "README.md"
 requires-python = ">=3.11"

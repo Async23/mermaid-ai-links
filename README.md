@@ -104,7 +104,7 @@ curl -fsS http://127.0.0.1:9222/json/version
 项目使用 `uv` 管理环境和命令入口，通过目标标签的原生 CDP WebSocket 连接系统 Chrome，不下载或启动内置浏览器。普通安装：
 
 ```zsh
-uv tool install git+https://github.com/Async23/mermaid-ai-links.git@v0.2.0
+uv tool install git+https://github.com/Async23/mermaid-ai-links.git@v0.2.3
 ```
 
 从源码开发：
@@ -123,7 +123,7 @@ mkdir -p ~/.config/mermaid-ai-inject
 CONFIG="$HOME/.config/mermaid-ai-inject/config.yaml"
 test -e "$CONFIG" || \
   curl -fsSL \
-    https://raw.githubusercontent.com/Async23/mermaid-ai-links/v0.2.0/config.example.yaml \
+    https://raw.githubusercontent.com/Async23/mermaid-ai-links/v0.2.3/config.example.yaml \
     -o "$CONFIG"
 chmod 600 ~/.config/mermaid-ai-inject/config.yaml
 ```
@@ -133,8 +133,8 @@ chmod 600 ~/.config/mermaid-ai-inject/config.yaml
 也可以通过 npm/npx 使用同一套 Python 核心（仍需先安装 Python 3.11+ 与 `uv`）：
 
 ```zsh
-npx -y mermaid-ai-links@0.2.0 --version
-npx -y mermaid-ai-links@0.2.0 doctor
+npx -y mermaid-ai-links@latest --version
+npx -y mermaid-ai-links@latest doctor
 ```
 
 链接密钥首次同步时自动生成在：
@@ -269,7 +269,7 @@ AI Host 的通用配置形态：
   "mcpServers": {
     "mermaid-ai-links": {
       "command": "npx",
-      "args": ["-y", "mermaid-ai-links@0.2.0", "mcp"]
+      "args": ["-y", "mermaid-ai-links@latest", "mcp"]
     }
   }
 }
