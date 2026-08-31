@@ -19,7 +19,7 @@ classifiers = [
   "Topic :: Documentation",
 ]
 dependencies = [
-  "mcp>=1.28,<2",
+  "mcp>=1.28,<3",
   "PyYAML>=6,<7",
   "websocket-client>=1.8,<2",
 ]
